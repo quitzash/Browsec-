@@ -11,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.NODE_ENV === 'production' && process.env.PORT ? Number(process.env.PORT) : 3000;
 
 // Body parsing
 app.use(express.json());
@@ -279,16 +279,36 @@ app.all('/api/proxy', async (req: Request, res: Response) => {
     `);
   }
 
-  const targetUrl = validation.url;
+  let targetUrl = validation.url;
   const tabId = (req.query.tabId as string) || '';
   const isPrivate = req.query.isPrivate === 'true';
 
+  // If user searched via Google (which blocks Cloud Run datacenter proxies with 401),
+  // automatically rewrite search queries to DuckDuckGo HTML for flawless results
   try {
-    // Forward requested headers while setting proper agent
+    const parsedTarget = new URL(targetUrl);
+    if (parsedTarget.hostname.includes('google.') && (parsedTarget.pathname === '/search' || parsedTarget.pathname.startsWith('/search'))) {
+      const q = parsedTarget.searchParams.get('q');
+      if (q) {
+        targetUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+      }
+    }
+  } catch {}
+
+  try {
+    // Forward requested headers while setting realistic modern browser headers
     const forwardHeaders: Record<string, string> = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': req.headers['accept'] || 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': req.headers['accept-language'] || 'en-US,en;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
     };
 
     // Attach isolated session cookies for this tab if available
@@ -297,7 +317,7 @@ app.all('/api/proxy', async (req: Request, res: Response) => {
     }
 
     const fetchOptions: RequestInit = {
-      method: req.method,
+      method: req.method === 'POST' ? 'POST' : 'GET',
       headers: forwardHeaders,
       redirect: 'follow',
       signal: AbortSignal.timeout(18000),
@@ -306,6 +326,116 @@ app.all('/api/proxy', async (req: Request, res: Response) => {
     const response = await fetch(targetUrl, fetchOptions);
     const finalUrl = response.url;
     const contentType = response.headers.get('content-type') || '';
+
+    // If host responds with 401 / 403 or blocks datacenter proxies:
+    if (response.status === 401 || response.status === 403) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(200).send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Access Restricted by Host</title>
+            <style>
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background-color: #0c0d10;
+                color: #f3f4f6;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                margin: 0;
+                padding: 24px;
+                box-sizing: border-box;
+              }
+              .card {
+                max-width: 540px;
+                width: 100%;
+                background: #16171c;
+                border: 1px solid #282a32;
+                border-radius: 16px;
+                padding: 32px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+              }
+              .badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 4px 10px;
+                background: rgba(239, 68, 68, 0.12);
+                border: 1px solid rgba(239, 68, 68, 0.25);
+                color: #f87171;
+                border-radius: 9999px;
+                font-size: 11px;
+                font-weight: 600;
+                margin-bottom: 16px;
+              }
+              h1 { font-size: 20px; font-weight: 600; margin: 0 0 10px; color: #fff; }
+              p { font-size: 13px; line-height: 1.6; color: #9ca3af; margin: 0 0 20px; }
+              .url-box {
+                background: #0d0e12;
+                border: 1px solid #23252d;
+                border-radius: 8px;
+                padding: 10px 12px;
+                font-family: monospace;
+                font-size: 11px;
+                color: #cbd5e1;
+                word-break: break-all;
+                margin-bottom: 24px;
+              }
+              .actions {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+              }
+              button, a {
+                padding: 11px 16px;
+                border-radius: 10px;
+                font-size: 13px;
+                font-weight: 500;
+                cursor: pointer;
+                text-align: center;
+                text-decoration: none;
+                transition: all 0.15s ease;
+                display: block;
+              }
+              .btn-primary {
+                background: #0284c7;
+                border: 1px solid #0369a1;
+                color: #fff;
+              }
+              .btn-primary:hover { background: #0369a1; }
+              .btn-secondary {
+                background: #23252d;
+                border: 1px solid #333642;
+                color: #e2e8f0;
+              }
+              .btn-secondary:hover { background: #2d303a; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <div class="badge">HTTP ${response.status} Host Restriction</div>
+              <h1>Cloud Proxy Restriction</h1>
+              <p>This destination website enforces strict anti-proxy controls that block datacenter IP addresses from rendering its pages.</p>
+              <div class="url-box">${targetUrl}</div>
+              <div class="actions">
+                <button class="btn-primary" onclick="window.parent.postMessage({type: 'APEX_SWITCH_TO_DIRECT'}, '*')">
+                  Switch to Direct Mode (Bypasses Proxy)
+                </button>
+                <button class="btn-secondary" onclick="window.parent.postMessage({type: 'APEX_NAVIGATE_TO', url: 'https://duckduckgo.com'}, '*')">
+                  Open DuckDuckGo Search
+                </button>
+                <button class="btn-secondary" onclick="window.parent.postMessage({type: 'APEX_NAVIGATE_HOME'}, '*')">
+                  Return to Homepage
+                </button>
+              </div>
+            </div>
+          </body>
+        </html>
+      `);
+    }
 
     // Capture and isolate any set-cookie response headers for this tab
     const setCookieHeader = response.headers.get('set-cookie');
@@ -331,6 +461,73 @@ app.all('/api/proxy', async (req: Request, res: Response) => {
     if (contentType.includes('text/html')) {
       const htmlText = await response.text();
       const $ = cheerio.load(htmlText);
+
+      // Check if page body returned Google's "401. That's an error"
+      if (htmlText.includes('That’s an error') && (htmlText.includes('401') || htmlText.includes('malformed'))) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.send(`
+          <!DOCTYPE html>
+          <html>
+            <head>
+              <meta charset="utf-8">
+              <title>Search Provider Proxy Notice</title>
+              <style>
+                body {
+                  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                  background-color: #0c0d10;
+                  color: #f3f4f6;
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+                  min-height: 100vh;
+                  margin: 0;
+                  padding: 24px;
+                  box-sizing: border-box;
+                }
+                .card {
+                  max-width: 520px;
+                  width: 100%;
+                  background: #16171c;
+                  border: 1px solid #282a32;
+                  border-radius: 16px;
+                  padding: 32px;
+                  box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+                  text-align: center;
+                }
+                h1 { font-size: 20px; font-weight: 600; margin: 0 0 10px; color: #fff; }
+                p { font-size: 13px; line-height: 1.6; color: #9ca3af; margin: 0 0 24px; }
+                .actions { display: flex; flex-direction: column; gap: 10px; }
+                button {
+                  padding: 12px 18px;
+                  border-radius: 10px;
+                  font-size: 13px;
+                  font-weight: 500;
+                  cursor: pointer;
+                  transition: all 0.15s ease;
+                }
+                .btn-primary { background: #0284c7; border: 1px solid #0369a1; color: #fff; }
+                .btn-primary:hover { background: #0369a1; }
+                .btn-secondary { background: #23252d; border: 1px solid #333642; color: #e2e8f0; }
+                .btn-secondary:hover { background: #2d303a; }
+              </style>
+            </head>
+            <body>
+              <div class="card">
+                <h1>Google Search Proxy Notice</h1>
+                <p>Google blocks datacenter cloud proxies from loading its search results directly. Switch to DuckDuckGo for unrestricted live web search, or view Google in Direct Mode.</p>
+                <div class="actions">
+                  <button class="btn-primary" onclick="window.parent.postMessage({type: 'APEX_NAVIGATE_TO', url: 'https://duckduckgo.com'}, '*')">
+                    Search with DuckDuckGo
+                  </button>
+                  <button class="btn-secondary" onclick="window.parent.postMessage({type: 'APEX_SWITCH_TO_DIRECT'}, '*')">
+                    Switch to Direct Mode
+                  </button>
+                </div>
+              </div>
+            </body>
+          </html>
+        `);
+      }
 
       // 1. Remove frame-busting scripts
       $('script').each((_, el) => {
@@ -594,9 +791,17 @@ async function setupServer() {
     });
   }
 
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Apex Browser full-stack server running on http://0.0.0.0:${PORT}`);
   });
+
+  const shutdown = () => {
+    server.close(() => {
+      process.exit(0);
+    });
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
 setupServer();

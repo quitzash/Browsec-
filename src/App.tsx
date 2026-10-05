@@ -611,6 +611,7 @@ export default function App() {
             onNavigate={handleNavigate}
             onUpdateMetadata={handleUpdateMetadata}
             onSetLoading={handleSetLoading}
+            onSwitchToDirect={handleToggleProxyMode}
           />
         )}
 

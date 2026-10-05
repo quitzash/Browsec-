@@ -4,13 +4,13 @@ export const SEARCH_ENGINES: SearchEngine[] = [
   {
     id: 'duckduckgo',
     name: 'DuckDuckGo',
-    searchUrl: 'https://duckduckgo.com/?q=%s',
+    searchUrl: 'https://html.duckduckgo.com/html/?q=%s',
     icon: '🦆',
   },
   {
     id: 'google',
-    name: 'Google',
-    searchUrl: 'https://www.google.com/search?q=%s',
+    name: 'Google (Proxied)',
+    searchUrl: 'https://html.duckduckgo.com/html/?q=%s',
     icon: '🔍',
   },
   {

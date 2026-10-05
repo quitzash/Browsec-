@@ -13,6 +13,7 @@ interface WebFrameProps {
   onNavigate: (url: string) => void;
   onUpdateMetadata: (title: string, favicon?: string) => void;
   onSetLoading: (loading: boolean) => void;
+  onSwitchToDirect?: () => void;
 }
 
 export const WebFrame: React.FC<WebFrameProps> = ({
@@ -26,6 +27,7 @@ export const WebFrame: React.FC<WebFrameProps> = ({
   onNavigate,
   onUpdateMetadata,
   onSetLoading,
+  onSwitchToDirect,
 }) => {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [loadError, setLoadError] = useState(false);
@@ -63,12 +65,18 @@ export const WebFrame: React.FC<WebFrameProps> = ({
         case 'APEX_NAVIGATE_HOME':
           onNavigate('apex://newtab');
           break;
+
+        case 'APEX_SWITCH_TO_DIRECT':
+          if (onSwitchToDirect) {
+            onSwitchToDirect();
+          }
+          break;
       }
     };
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [onNavigate, onUpdateMetadata, onSetLoading]);
+  }, [onNavigate, onUpdateMetadata, onSetLoading, onSwitchToDirect]);
 
   // Handle iframe load event
   const handleIframeLoad = () => {
