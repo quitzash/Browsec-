@@ -9,8 +9,8 @@ export const SEARCH_ENGINES: SearchEngine[] = [
   },
   {
     id: 'google',
-    name: 'Google (Proxied)',
-    searchUrl: 'https://html.duckduckgo.com/html/?q=%s',
+    name: 'Google',
+    searchUrl: 'https://www.google.com/search?q=%s',
     icon: '🔍',
   },
   {

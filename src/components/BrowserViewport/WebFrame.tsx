@@ -37,6 +37,8 @@ export const WebFrame: React.FC<WebFrameProps> = ({
   const [elapsedMs, setElapsedMs] = useState(0);
   const [upstreamActive, setUpstreamActive] = useState<boolean | null>(null);
   const lastSrcRef = useRef<string | null>(null);
+  // Direct mode shows the real site from this browser, which only works if the site allows being embedded.
+  const [frameCheck, setFrameCheck] = useState<{ url: string; framable: boolean; reason: string } | null>(null);
 
   const targetLabel = React.useMemo(() => {
     try {
@@ -73,7 +75,28 @@ export const WebFrame: React.FC<WebFrameProps> = ({
     }
   }, [iframeSrc]);
 
-  const showOverlay = isLoading && !domReady && !!iframeSrc && !loadError;
+  useEffect(() => {
+    if (mode !== 'direct' || !iframeSrc) return;
+    let cancelled = false;
+    setFrameCheck(null);
+    fetch(`/api/network?frameable=true&url=${encodeURIComponent(url)}`)
+      .then((res) => res.json())
+      .then((data) => !cancelled && setFrameCheck({ url, framable: data.frameable !== false, reason: String(data.reason || '') }))
+      .catch(() => !cancelled && setFrameCheck({ url, framable: true, reason: 'unchecked' }));
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, url, iframeSrc]);
+
+  const directBlocked = mode === 'direct' && !!frameCheck && frameCheck.url === url && !frameCheck.framable;
+  const directPending = mode === 'direct' && !!iframeSrc && !(frameCheck && frameCheck.url === url);
+
+  // A blocked site has nothing to wait for.
+  useEffect(() => {
+    if (directBlocked) onSetLoading(false);
+  }, [directBlocked, onSetLoading]);
+
+  const showOverlay = isLoading && !domReady && !!iframeSrc && !loadError && !directBlocked;
 
   // Elapsed-time ticker for the overlay.
   useEffect(() => {
@@ -246,7 +269,28 @@ export const WebFrame: React.FC<WebFrameProps> = ({
           transformOrigin: 'top center',
         }}
       >
-        {loadError ? (
+        {directBlocked ? (
+          <div className="flex flex-col items-center justify-center h-full p-8 text-center bg-[#131418] text-neutral-300">
+            <div className="w-12 h-12 rounded-xl bg-sky-500/10 border border-sky-500/20 flex items-center justify-center text-sky-400 mb-4">
+              <ShieldAlert className="w-6 h-6" />
+            </div>
+            <h3 className="text-lg font-semibold text-white mb-2">{targetLabel} can't be shown here</h3>
+            <p className="text-sm text-neutral-400 max-w-md mb-6 leading-relaxed">
+              On your own connection, {frameCheck?.reason || 'this site refuses to be embedded'}. Open it in a new tab to use it with your real location, or go back to the server/proxy connection in Settings.
+            </p>
+            <a
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-medium transition-colors flex items-center gap-2"
+            >
+              <span>Open in a new tab</span>
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          </div>
+        ) : directPending ? (
+          <div className="h-full w-full bg-[#0a0a0c]" />
+        ) : loadError ? (
           <div className="flex flex-col items-center justify-center h-full p-8 text-center bg-[#131418] text-neutral-300">
             <div className="w-12 h-12 rounded-xl bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400 mb-4">
               <AlertTriangle className="w-6 h-6" />
@@ -290,6 +334,9 @@ export const WebFrame: React.FC<WebFrameProps> = ({
             className="w-full h-full border-none bg-white"
             // We provide proper sandbox permissions for web apps to execute scripts, forms, and popups safely
             sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
+            // Let pages use the device's own location (exact, unlike the proxy's IP), fullscreen video, autoplay and the clipboard.
+            allow="geolocation; fullscreen; autoplay; clipboard-write; encrypted-media; picture-in-picture"
+            allowFullScreen
             referrerPolicy="no-referrer"
           />
         )}

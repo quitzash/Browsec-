@@ -11,9 +11,15 @@ export class Semaphore {
 
   constructor(private readonly max: number) {}
 
-  acquire(): Promise<() => void> {
+  /**
+   * Waits for a free slot. After `maxWaitMs` the caller proceeds anyway (fail open), so a few slow or hung
+   * requests can never starve everything queued behind them.
+   */
+  acquire(maxWaitMs = 4000): Promise<() => void> {
     return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const grant = () => {
+        if (timer) clearTimeout(timer);
         this.active++;
         let released = false;
         resolve(() => {
@@ -23,8 +29,16 @@ export class Semaphore {
           this.queue.shift()?.();
         });
       };
-      if (this.active < this.max) grant();
-      else this.queue.push(grant);
+      if (this.active < this.max) {
+        grant();
+        return;
+      }
+      this.queue.push(grant);
+      timer = setTimeout(() => {
+        const index = this.queue.indexOf(grant);
+        if (index !== -1) this.queue.splice(index, 1);
+        resolve(() => {});
+      }, maxWaitMs);
     });
   }
 }

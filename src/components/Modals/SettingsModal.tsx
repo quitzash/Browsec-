@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { BrowserSettings } from '../../types';
 import { SEARCH_ENGINES, THEMES } from '../../constants/presets';
-import { Settings, X, Shield, Search, Globe, Bookmark, Palette, Network, Activity, RefreshCw, Check } from 'lucide-react';
+import { Settings, X, Shield, Search, Globe, Bookmark, Palette, Network, Activity, RefreshCw, Check, MapPin } from 'lucide-react';
 
 interface UpstreamProxyStatus {
   enabled: boolean;
@@ -31,11 +31,41 @@ interface ProxyScan {
   items: RankedProxy[];
 }
 
+interface GeoInfo {
+  ip: string;
+  countryCode: string;
+  country: string;
+  region?: string;
+  city?: string;
+}
+
+const MATCH_COUNTRIES = [
+  'US', 'GB', 'DE', 'FR', 'NL', 'CA', 'AU', 'SG', 'JP', 'IN', 'BR', 'ID', 'TH', 'VN', 'TR', 'RU', 'UA', 'PL', 'IT', 'ES',
+  'MX', 'ZA', 'KR', 'HK', 'AE', 'PH', 'PK', 'BD', 'AR', 'CL',
+];
+
+const flag = (code: string) =>
+  /^[A-Z]{2}$/.test(code) ? String.fromCodePoint(...[...code].map((c) => 127397 + c.charCodeAt(0))) : '🌐';
+
+const countryName = (code: string) => {
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'region' }).of(code) || code;
+  } catch {
+    return code;
+  }
+};
+
+const describeGeo = (g: GeoInfo | null) =>
+  g ? [g.city, g.region && g.region !== g.city ? g.region : '', g.country || countryName(g.countryCode)].filter(Boolean).join(', ') : '';
+
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   settings: BrowserSettings;
   onUpdateSettings: (newSettings: Partial<BrowserSettings>) => void;
+  /** How the active tab reaches sites: 'direct' = this browser's own connection, 'proxy' = through the server. */
+  connection: 'direct' | 'proxy';
+  onSetConnection: (connection: 'direct' | 'proxy') => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -43,6 +73,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onClose,
   settings,
   onUpdateSettings,
+  connection,
+  onSetConnection,
 }) => {
   const [proxy, setProxy] = useState<UpstreamProxyStatus | null>(null);
   const [proxyUrl, setProxyUrl] = useState('');
@@ -51,6 +83,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Location: what sites see (the server or proxy exit) versus where the user really is.
+  const [egress, setEgress] = useState<GeoInfo | null>(null);
+  const [egressViaProxy, setEgressViaProxy] = useState(false);
+  const [realGeo, setRealGeo] = useState<GeoInfo | null>(null);
+  const [realFailed, setRealFailed] = useState(false);
+  const [matchCountry, setMatchCountry] = useState('');
+  const [locBusy, setLocBusy] = useState(false);
+  const [locMsg, setLocMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -68,6 +108,38 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       cancelled = true;
     };
   }, [isOpen]);
+
+  const refreshEgress = useCallback(async () => {
+    try {
+      const res = await fetch('/api/network?location=true');
+      const data = await res.json();
+      setEgress(data.egress || null);
+      setEgressViaProxy(!!data.viaProxy);
+    } catch {
+      setEgress(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    refreshEgress();
+    // Looked up by the browser itself, so it reflects the user's own connection and not this server's.
+    fetch('https://ipwho.is/')
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        if (data && data.success !== false && data.country_code) {
+          setRealGeo({ ip: data.ip, countryCode: data.country_code, country: data.country, region: data.region, city: data.city });
+          setMatchCountry((prev) => prev || data.country_code);
+          setRealFailed(false);
+        } else setRealFailed(true);
+      })
+      .catch(() => !cancelled && setRealFailed(true));
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, refreshEgress]);
 
   const saveProxy = useCallback(async (payload: { enabled?: boolean; url?: string; test?: boolean; revertOnFail?: boolean }) => {
     setBusy(true);
@@ -114,6 +186,49 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     (url: string) => saveProxy({ url, enabled: true, test: true, revertOnFail: true }),
     [saveProxy],
   );
+
+  const matchLocation = async () => {
+    const code = matchCountry || realGeo?.countryCode;
+    if (!code) return;
+    setLocBusy(true);
+    setLocMsg(`Looking for a working proxy that really exits in ${countryName(code)}. This takes about 40 seconds…`);
+    try {
+      const res = await fetch(`/api/network?proxies=true&country=${code}&refresh=true`);
+      const data = await res.json();
+      const items: RankedProxy[] = data?.proxies?.items ?? [];
+      if (!items.length) {
+        setLocMsg(`No working free proxy exits in ${countryName(code)} right now. Try again in a minute, or pick a nearby country.`);
+        return;
+      }
+      for (const item of items.slice(0, 4)) {
+        const params = new URLSearchParams({ enabled: 'true', url: item.url, test: 'true', revertOnFail: 'true', expectCountry: code });
+        const r = await fetch(`/api/network?${params.toString()}`, { method: 'POST' });
+        const d = await r.json();
+        if (d.proxy) {
+          setProxy(d.proxy);
+          setProxyUrl(d.proxy.url);
+        }
+        if (!d.reverted) {
+          setLocMsg(`Done. Sites now see you in ${countryName(code)}.`);
+          await refreshEgress();
+          return;
+        }
+      }
+      setLocMsg(`Found proxies listed for ${countryName(code)}, but none passed the check just now. Try again.`);
+    } catch {
+      setLocMsg('The location search failed. Check your connection and try again.');
+    } finally {
+      setLocBusy(false);
+    }
+  };
+
+  const isDirect = connection === 'direct';
+  const egressCode = egress?.countryCode || '';
+  const realCode = realGeo?.countryCode || '';
+  // In direct mode the browser itself loads the site, so the server's address is irrelevant.
+  const seenAs = isDirect ? realGeo : egress;
+  const seenCode = isDirect ? realCode : egressCode;
+  const mismatch = !!seenCode && !!realCode && seenCode !== realCode;
 
   if (!isOpen) return null;
 
@@ -239,6 +354,104 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="h-px bg-[#242630]" />
+
+          {/* Location */}
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-white flex items-center gap-1.5">
+              <MapPin className="w-3.5 h-3.5 text-rose-400" />
+              <span>Location</span>
+            </label>
+            <p className="text-[11px] text-neutral-400">
+              {isDirect
+                ? 'Your own connection: sites see your real address, exactly as in any normal browser.'
+                : 'Through this server: sites see the address your traffic leaves from, not your device. Without a proxy that is the server itself.'}
+            </p>
+            <div className="grid grid-cols-2 gap-2 pt-0.5">
+              {([
+                ['direct', 'My own connection', 'Shows your real location'],
+                ['proxy', 'Through server / proxy', 'Fetched by the server'],
+              ] as const).map(([value, title, hint]) => (
+                <button
+                  key={value}
+                  onClick={() => onSetConnection(value)}
+                  className={`text-left p-2.5 rounded-xl border transition-all ${
+                    connection === value
+                      ? 'bg-sky-500/15 border-sky-500/50 text-white'
+                      : 'bg-[#191b22] border-[#272933] text-neutral-300 hover:bg-[#20222b]'
+                  }`}
+                >
+                  <span className="block text-xs font-medium">{title}</span>
+                  <span className="block text-[10px] text-neutral-400">{hint}</span>
+                </button>
+              ))}
+            </div>
+            <div className="rounded-lg border border-[#272933] bg-[#191b22] divide-y divide-[#272933]">
+              <div className="flex items-center justify-between gap-2 px-2.5 py-2">
+                <span className="text-[11px] text-neutral-400">Sites see you in</span>
+                <span className="text-[11px] text-white truncate">
+                  {seenAs ? `${flag(seenAs.countryCode)} ${describeGeo(seenAs)}` : isDirect && realFailed ? "couldn't detect" : 'checking…'}
+                  <span className="ml-1.5 text-[10px] text-neutral-500">
+                    {isDirect ? 'your connection' : egressViaProxy ? 'via proxy' : 'via server'}
+                  </span>
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2 px-2.5 py-2">
+                <span className="text-[11px] text-neutral-400">You appear to be in</span>
+                <span className="text-[11px] text-white truncate">
+                  {realGeo ? `${flag(realGeo.countryCode)} ${describeGeo(realGeo)}` : realFailed ? "couldn't detect" : 'checking…'}
+                </span>
+              </div>
+            </div>
+            {mismatch && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 space-y-1.5">
+                <p className="text-[11px] text-amber-300">
+                  Sites see {countryName(seenCode)}, but you are in {countryName(realCode)}.
+                </p>
+                <button
+                  onClick={() => onSetConnection('direct')}
+                  className="px-2.5 py-1.5 rounded-md bg-amber-500/20 hover:bg-amber-500/30 text-amber-100 text-[11px] font-medium transition-colors"
+                >
+                  Use my own connection ({countryName(realCode)})
+                </button>
+              </div>
+            )}
+            {isDirect && (
+              <p className="text-[10px] text-neutral-500 leading-relaxed">
+                Sites that don't allow being shown inside another page open in a new tab instead, still on your own connection.
+              </p>
+            )}
+            <div className={`flex gap-2 pt-1 ${isDirect ? 'hidden' : ''}`}>
+              <select
+                value={matchCountry}
+                onChange={(e) => setMatchCountry(e.target.value)}
+                disabled={locBusy}
+                className="flex-1 min-w-0 bg-[#191b22] border border-[#272933] rounded-lg px-2.5 py-2 text-xs text-white focus:outline-none focus:border-sky-500"
+              >
+                {[...new Set([realCode, ...MATCH_COUNTRIES].filter(Boolean))].map((code) => (
+                  <option key={code} value={code}>
+                    {flag(code)} {countryName(code)}
+                    {code === realCode ? ' (detected)' : ''}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={matchLocation}
+                disabled={locBusy || busy || !matchCountry}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium disabled:opacity-50 transition-colors shrink-0"
+              >
+                <MapPin className={`w-3 h-3 ${locBusy ? 'animate-pulse' : ''}`} />
+                {locBusy ? 'Searching…' : 'Match my location'}
+              </button>
+            </div>
+            {!isDirect && locMsg && <p className="text-[11px] text-neutral-300 leading-relaxed">{locMsg}</p>}
+            {!isDirect && (
+              <p className="text-[10px] text-neutral-500 leading-relaxed">
+                A proxy can only match your country, not your city, and free ones are slow. Sites that ask your browser for your location get your device's real position either way.
+              </p>
+            )}
           </div>
 
           <div className="h-px bg-[#242630]" />

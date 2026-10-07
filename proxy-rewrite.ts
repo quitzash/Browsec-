@@ -188,7 +188,19 @@ const SHIM_SOURCE = String.raw`
     return nativeOpen.apply(this, args);
   };
 
-  function patchProp(ctor, prop) {
+  function wrapSrcset(v) {
+    try {
+      return String(v).split(/,\s+/).map(function (part) {
+        var bits = part.trim().split(/\s+/);
+        if (!bits[0]) return part;
+        bits[0] = wrap(bits[0]);
+        return bits.join(' ');
+      }).join(', ');
+    } catch (e) { return v; }
+  }
+
+  function patchProp(ctor, prop, transform) {
+    transform = transform || wrap;
     try {
       if (!ctor) return;
       var d = Object.getOwnPropertyDescriptor(ctor.prototype, prop);
@@ -197,7 +209,7 @@ const SHIM_SOURCE = String.raw`
         configurable: true,
         enumerable: d.enumerable,
         get: d.get,
-        set: function (v) { d.set.call(this, wrap(v)); }
+        set: function (v) { d.set.call(this, transform(v)); }
       });
     } catch (e) {}
   }
@@ -209,6 +221,8 @@ const SHIM_SOURCE = String.raw`
   patchProp(window.HTMLLinkElement, 'href');
   patchProp(window.HTMLEmbedElement, 'src');
   patchProp(window.HTMLTrackElement, 'src');
+  patchProp(window.HTMLImageElement, 'srcset', wrapSrcset);
+  patchProp(window.HTMLSourceElement, 'srcset', wrapSrcset);
 
   var nativeSetAttribute = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function (name, value) {
@@ -218,6 +232,8 @@ const SHIM_SOURCE = String.raw`
       if ((n === 'src' && /^(IMG|SCRIPT|SOURCE|VIDEO|AUDIO|IFRAME|EMBED|TRACK|INPUT)$/.test(t)) ||
           (n === 'href' && t === 'LINK') || (n === 'poster' && t === 'VIDEO')) {
         value = wrap(value);
+      } else if (n === 'srcset' && (t === 'IMG' || t === 'SOURCE')) {
+        value = wrapSrcset(value);
       }
     } catch (e) {}
     return nativeSetAttribute.call(this, name, value);

@@ -2,11 +2,11 @@ import express from 'express';
 import type { Request, Response } from 'express';
 import * as cheerio from 'cheerio';
 import dotenv from 'dotenv';
-import { ProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
+import { Agent, ProxyAgent, fetch as undiciFetch, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import net from 'net';
 import { Readable } from 'stream';
 import { createHash } from 'crypto';
-import { getRankedProxies } from './proxy-scanner.ts';
+import { getRankedProxies, lookupExit } from './proxy-scanner.ts';
 import { AssetCache, Semaphore, pageUrlFromReferer, sendText, type CachedAsset } from './proxy-perf.ts';
 import { buildClientShim, rewriteCss, rewriteHtmlResources, rewriteJsImports } from './proxy-rewrite.ts';
 
@@ -163,6 +163,56 @@ function publicOrigin(req: Request): string {
   return `${proto}://${host}`;
 }
 
+// Direct mode shows a site inside the app using the visitor's own connection, which only works if the site allows
+// being embedded. Look at its framing headers so the app can offer a new tab instead of a broken page.
+const frameCache = new Map<string, { frameable: boolean; reason: string; at: number }>();
+const directAgent = new Agent();
+
+async function checkFrameable(rawUrl: string): Promise<{ frameable: boolean; reason: string }> {
+  const valid = sanitizeAndValidateUrl(rawUrl);
+  if (!valid.valid || !valid.url) return { frameable: true, reason: 'unchecked' };
+  const target = new URL(valid.url);
+  const key = target.origin + target.pathname;
+  const cached = frameCache.get(key);
+  if (cached && Date.now() - cached.at < 10 * 60 * 1000) return { frameable: cached.frameable, reason: cached.reason };
+
+  let result = { frameable: true, reason: 'unchecked' };
+  try {
+    const res = await undiciFetch(valid.url, {
+      dispatcher: directAgent,
+      redirect: 'follow',
+      signal: AbortSignal.timeout(6000),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+      },
+    });
+    res.body?.cancel().catch(() => {});
+    if (res.status >= 400) {
+      // Blocked or erroring for this server's address: the headers say nothing about the visitor's browser.
+      result = { frameable: true, reason: 'unchecked' };
+    } else {
+      const csp = res.headers.get('content-security-policy') || '';
+      const ancestors = csp.match(/frame-ancestors([^;]*)/i);
+      const xfo = (res.headers.get('x-frame-options') || '').toLowerCase();
+      if (ancestors) {
+        const tokens = ancestors[1].trim().split(/\s+/).filter(Boolean);
+        result = tokens.includes('*')
+          ? { frameable: true, reason: 'allowed' }
+          : { frameable: false, reason: 'the site restricts which pages can embed it' };
+      } else if (/deny|sameorigin|allow-from/.test(xfo)) {
+        result = { frameable: false, reason: 'the site does not allow embedding' };
+      } else {
+        result = { frameable: true, reason: 'allowed' };
+      }
+    }
+  } catch {
+    result = { frameable: true, reason: 'unchecked' };
+  }
+  frameCache.set(key, { ...result, at: Date.now() });
+  return result;
+}
+
 function jarCookieName(tabId: string): string {
   return `apex_jar_${tabId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
@@ -209,9 +259,17 @@ export function createApiApp(): express.Express {
   });
 
   app.get('/api/network', async (req: Request, res: Response) => {
+    if (req.query.frameable === 'true') {
+      return res.json(await checkFrameable(String(req.query.url || '')));
+    }
+    if (req.query.location === 'true') {
+      // What websites see right now: the exit of the upstream proxy if one is active, otherwise this server itself.
+      const exit = await lookupExit(null, 8000);
+      return res.json({ proxy: proxyStatus(), egress: exit, viaProxy: upstream.enabled && !upstream.error });
+    }
     if (req.query.proxies === 'true') {
       try {
-        const proxies = await getRankedProxies(req.query.refresh === 'true');
+        const proxies = await getRankedProxies(req.query.refresh === 'true', typeof req.query.country === 'string' ? req.query.country : undefined);
         return res.json({ proxy: proxyStatus(), proxies });
       } catch (err: any) {
         return res.status(502).json({ proxy: proxyStatus(), error: err?.message || 'Proxy scan failed' });
@@ -227,6 +285,7 @@ export function createApiApp(): express.Express {
     const rawEnabled = body.enabled ?? query.enabled;
     const rawTest = body.test ?? query.test;
     const rawRevert = body.revertOnFail ?? query.revertOnFail;
+    const rawExpectCountry = body.expectCountry ?? query.expectCountry;
     const previous = { url: upstream.url, enabled: upstream.enabled, source: upstream.source };
 
     if (typeof rawUrl === 'string') {
@@ -273,6 +332,24 @@ export function createApiApp(): express.Express {
         upstream.lastTest = failed;
         return res.json({ proxy: proxyStatus(), reverted: true });
       }
+    }
+
+    // Verify the proxy really exits where we were told, using the exit IP's own country, not the list's claim.
+    if (typeof rawExpectCountry === 'string' && /^[A-Za-z]{2}$/.test(rawExpectCountry) && upstream.enabled && !upstream.error) {
+      const expected = rawExpectCountry.toUpperCase();
+      const exit = await lookupExit(null, 9000);
+      if (!exit || exit.countryCode !== expected) {
+        upstream.url = previous.url;
+        upstream.enabled = previous.enabled;
+        upstream.source = previous.source;
+        applyUpstreamProxy();
+        return res.json({
+          proxy: proxyStatus(),
+          reverted: true,
+          reason: exit ? `exits in ${exit.country || exit.countryCode}, not ${expected}` : 'could not verify where it exits',
+        });
+      }
+      return res.json({ proxy: proxyStatus(), egress: exit });
     }
 
     return res.json({ proxy: proxyStatus() });
@@ -498,7 +575,7 @@ export function createApiApp(): express.Express {
       `);
     }
 
-    let targetUrl = validation.url;
+    const targetUrl = validation.url;
     const tabId = pathTab || (req.query.tabId as string) || '';
     const isPrivate = pathPrivate || req.query.isPrivate === 'true';
     const rewriteCtx = { tabId, isPrivate, origin: publicOrigin(req) };
@@ -515,25 +592,20 @@ export function createApiApp(): express.Express {
     const jarName = tabId ? jarCookieName(tabId) : '';
     const existingJar = jarName ? decodeURIComponent(readCookie(req, jarName)) : '';
 
-    try {
-      const parsedTarget = new URL(targetUrl);
-      if (parsedTarget.hostname.includes('google.') && (parsedTarget.pathname === '/search' || parsedTarget.pathname.startsWith('/search'))) {
-        const q = parsedTarget.searchParams.get('q');
-        if (q) {
-          targetUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
-        }
-      }
-    } catch {}
+
 
     try {
       const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
       const targetOrigin = new URL(targetUrl).origin;
       const pageUrl = pageUrlFromReferer(req.headers.referer);
+      const rawLang = String(req.headers['accept-language'] || '');
+      const acceptLanguage = /^[\w\-,;=.* ]{2,200}$/.test(rawLang) ? rawLang : 'en-US,en;q=0.9';
       const forwardHeaders: Record<string, string> = isDocument
         ? {
             'User-Agent': UA,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
+            // The visitor's own language, so sites localise for them rather than for this server.
+            'Accept-Language': acceptLanguage,
             'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
             'Sec-Ch-Ua-Mobile': '?0',
             'Sec-Ch-Ua-Platform': '"Windows"',
@@ -546,7 +618,7 @@ export function createApiApp(): express.Express {
         : {
             'User-Agent': UA,
             'Accept': String(req.headers.accept || '*/*'),
-            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Language': acceptLanguage,
             // Hotlink protection and CORS checks look at the page that asked, not at the asset's own host.
             'Referer': pageUrl || `${targetOrigin}/`,
           };
@@ -602,12 +674,13 @@ export function createApiApp(): express.Express {
       const hit = cacheKey ? assetCache.get(cacheKey) : undefined;
       if (hit) return await emitAsset(hit, 'hit');
 
+      let releaseGate: (() => void) | null = null;
       // Queue behind the concurrency cap when an upstream proxy is carrying traffic. Media streams are exempt: they are few and long-lived.
       if (upstream.enabled && !upstream.error && dest !== 'video' && dest !== 'audio') {
-        const release = await upstreamGate.acquire();
-        res.on('close', release);
+        releaseGate = await upstreamGate.acquire();
+        res.on('close', releaseGate);
         if (res.destroyed) {
-          release();
+          releaseGate();
           return;
         }
       }
@@ -634,6 +707,9 @@ export function createApiApp(): express.Express {
         response = await fetch(targetUrl, fetchOptions);
       } finally {
         clearTimeout(headerTimer);
+        // The gate limits connection setup to a flaky proxy; once headers are back the slot is free again,
+        // so long-lived bodies (streams, long-polling) don't hold up the rest of the page.
+        releaseGate?.();
       }
       const finalUrl = response.url;
       const contentType = response.headers.get('content-type') || '';

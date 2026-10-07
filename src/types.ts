@@ -84,4 +84,6 @@ export interface BrowserSettings {
   theme: 'dark' | 'midnight' | 'studio' | 'black';
   showBookmarksBar: boolean;
   blockTrackers: boolean;
+  /** 'direct' loads sites from the visitor's own browser and connection; 'proxy' goes through this server. */
+  defaultMode: 'proxy' | 'direct';
 }

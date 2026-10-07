@@ -2,6 +2,15 @@ import { Agent, ProxyAgent, fetch as undiciFetch } from 'undici';
 
 export type SearchEngineId = 'duckduckgo' | 'bing' | 'wikipedia';
 
+export interface ExitInfo {
+  ip: string;
+  countryCode: string;
+  country: string;
+  region: string;
+  city: string;
+  timezone: string;
+}
+
 export interface ScannedProxy {
   url: string;
   host: string;
@@ -9,9 +18,12 @@ export interface ScannedProxy {
   stability: number;
   probes: number;
   engines: SearchEngineId[];
+  /** Where sites see you when this proxy carries your traffic, measured through the proxy itself. */
+  exit?: ExitInfo;
 }
 
 export interface ProxyScanResult {
+  country?: string;
   updatedAt: number;
   durationMs: number;
   tested: number;
@@ -56,8 +68,8 @@ const RECHECK_POOL = 20;
 const MAX_RESULTS = 12;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
-let cache: ProxyScanResult | null = null;
-let inflight: Promise<ProxyScanResult> | null = null;
+const caches = new Map<string, ProxyScanResult>();
+const inflights = new Map<string, Promise<ProxyScanResult>>();
 
 function isPublicIPv4(ip: string): boolean {
   const parts = ip.split('.').map(Number);
@@ -71,11 +83,15 @@ function isPublicIPv4(ip: string): boolean {
   return true;
 }
 
-async function loadCandidates(): Promise<string[]> {
+const COUNTRY_SOURCE = (code: string) =>
+  `https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/${code}/data.txt`;
+
+async function loadCandidates(country?: string): Promise<string[]> {
   // Always fetch the lists directly so a dead upstream proxy can't block finding a replacement.
   const direct = new Agent();
+  const sources = country ? [COUNTRY_SOURCE(country)] : SOURCES;
   const lists = await Promise.allSettled(
-    SOURCES.map(async (source) => {
+    sources.map(async (source) => {
       const res = await undiciFetch(source, { dispatcher: direct, signal: AbortSignal.timeout(10000) });
       if (!res.ok) throw new Error(`${source} responded ${res.status}`);
       return res.text();
@@ -126,6 +142,49 @@ async function probe(proxyUrl: string, target: Target, timeoutMs: number): Promi
   }
 }
 
+function parseExit(data: any): ExitInfo | null {
+  // ipwho.is: { success, ip, country, country_code, region, city, timezone: { id } }
+  if (data && data.success !== false && data.ip && (data.country_code || data.country)) {
+    return {
+      ip: String(data.ip),
+      countryCode: String(data.country_code || '').toUpperCase(),
+      country: String(data.country || ''),
+      region: String(data.region || ''),
+      city: String(data.city || ''),
+      timezone: String(data.timezone?.id || ''),
+    };
+  }
+  // api.country.is fallback: { ip, country: "DE" }
+  if (data && data.ip && typeof data.country === 'string' && data.country.length === 2) {
+    return { ip: String(data.ip), countryCode: data.country.toUpperCase(), country: data.country.toUpperCase(), region: '', city: '', timezone: '' };
+  }
+  return null;
+}
+
+const GEO_ENDPOINTS = ['https://ipwho.is/', 'https://api.country.is/'];
+
+/** Ask a geolocation service what it sees. With a proxy URL the request goes through that proxy; otherwise through the process default. */
+export async function lookupExit(proxyUrl: string | null, timeoutMs = 8000): Promise<ExitInfo | null> {
+  for (const endpoint of GEO_ENDPOINTS) {
+    const agent = proxyUrl ? new ProxyAgent({ uri: proxyUrl, connectTimeout: timeoutMs }) : undefined;
+    try {
+      const res = await undiciFetch(endpoint, {
+        ...(agent ? { dispatcher: agent } : {}),
+        signal: AbortSignal.timeout(timeoutMs),
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ApexLocationCheck/1.0)' },
+      });
+      if (!res.ok) continue;
+      const exit = parseExit(await res.json());
+      if (exit) return exit;
+    } catch {
+      // try the next endpoint
+    } finally {
+      agent?.destroy().catch(() => {});
+    }
+  }
+  return null;
+}
+
 async function runPool<T, R>(items: T[], concurrency: number, worker: (item: T) => Promise<R>): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let next = 0;
@@ -144,9 +203,9 @@ function median(values: number[]): number {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
-async function scan(): Promise<ProxyScanResult> {
+async function scan(country?: string): Promise<ProxyScanResult> {
   const started = Date.now();
-  const candidates = await loadCandidates();
+  const candidates = await loadCandidates(country);
 
   // Stage 1: cheap single probe to discard dead proxies.
   const firstPass = await runPool(candidates, STAGE1_CONCURRENCY, async (url) => ({
@@ -203,7 +262,7 @@ async function scan(): Promise<ProxyScanResult> {
     STAGE2_CONCURRENCY,
     async ({ p, engine }) => ({ p, engine, latency: await probe(p.url, ENGINE_TARGETS[engine], STAGE2_TIMEOUT_MS) }),
   );
-  const items = shortlist
+  const rechecked = shortlist
     .map((p) => {
       const passed = rechecks.filter((r) => r.p === p && r.latency !== null);
       return {
@@ -212,11 +271,18 @@ async function scan(): Promise<ProxyScanResult> {
         latencyMs: passed.length ? median([...passed.map((r) => r.latency as number), p.latencyMs]) : p.latencyMs,
       };
     })
-    .filter((p) => p.engines.length > 0)
+    .filter((p) => p.engines.length > 0);
+
+  // Where does each finalist really exit? Lists are often wrong, so ask a geolocation service through the proxy itself.
+  const exits = await Promise.all(rechecked.map((p) => lookupExit(p.url)));
+  const items = rechecked
+    .map((p, i): ScannedProxy => ({ ...p, exit: exits[i] || undefined }))
+    .filter((p) => !country || p.exit?.countryCode === country)
     .sort((a, b) => b.engines.length - a.engines.length || b.stability - a.stability || a.latencyMs - b.latencyMs)
     .slice(0, MAX_RESULTS);
 
   return {
+    country,
     updatedAt: Date.now(),
     durationMs: Date.now() - started,
     tested: candidates.length,
@@ -225,17 +291,22 @@ async function scan(): Promise<ProxyScanResult> {
   };
 }
 
-export async function getRankedProxies(refresh = false): Promise<ProxyScanResult> {
-  if (!refresh && cache && Date.now() - cache.updatedAt < CACHE_TTL_MS) return cache;
-  if (!inflight) {
-    inflight = scan()
+export async function getRankedProxies(refresh = false, country?: string): Promise<ProxyScanResult> {
+  const code = country && /^[A-Za-z]{2}$/.test(country) ? country.toUpperCase() : undefined;
+  const key = code || 'any';
+  const cached = caches.get(key);
+  if (!refresh && cached && Date.now() - cached.updatedAt < CACHE_TTL_MS) return cached;
+  let pending = inflights.get(key);
+  if (!pending) {
+    pending = scan(code)
       .then((result) => {
-        if (result.items.length > 0 || !cache) cache = result;
-        return cache!;
+        if (result.items.length > 0 || !caches.has(key)) caches.set(key, result);
+        return caches.get(key)!;
       })
       .finally(() => {
-        inflight = null;
+        inflights.delete(key);
       });
+    inflights.set(key, pending);
   }
-  return inflight;
+  return pending;
 }

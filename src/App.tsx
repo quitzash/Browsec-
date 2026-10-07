@@ -39,6 +39,7 @@ const DEFAULT_SETTINGS: BrowserSettings = {
   theme: 'dark',
   showBookmarksBar: true,
   blockTrackers: true,
+  defaultMode: 'proxy',
 };
 
 export default function App() {
@@ -131,6 +132,18 @@ export default function App() {
 
   // Tab Navigation Handler
   const handleNavigate = useCallback((url: string) => {
+    // Google is never proxied: it refuses to be framed and blocks proxy/datacenter IPs, so it opens as a
+    // normal browser tab that connects to Google directly.
+    try {
+      const { hostname } = new URL(url);
+      if (/^(www\.)?google\.[a-z.]+$/i.test(hostname)) {
+        window.open(url, '_blank', 'noopener,noreferrer');
+        return;
+      }
+    } catch {
+      // not an absolute URL: fall through to normal handling
+    }
+
     let currentIsPrivate = false;
     setTabs((prevTabs) =>
       prevTabs.map((t) => {
@@ -223,13 +236,13 @@ export default function App() {
       historyIndex: 0,
       isPinned: false,
       isPrivate: false,
-      mode: 'proxy',
+      mode: settings.defaultMode,
       scrollPercent: 0,
       zoom: 100,
     };
     setTabs((prev) => [...prev, newTabObj]);
     setActiveTabId(newId);
-  }, []);
+  }, [settings.defaultMode]);
 
   // New Private Tab Creator
   const handleNewPrivateTab = useCallback((initialUrl: string = 'apex://newtab') => {
@@ -244,13 +257,13 @@ export default function App() {
       historyIndex: 0,
       isPinned: false,
       isPrivate: true,
-      mode: 'proxy',
+      mode: settings.defaultMode,
       scrollPercent: 0,
       zoom: 100,
     };
     setTabs((prev) => [...prev, newTabObj]);
     setActiveTabId(newId);
-  }, []);
+  }, [settings.defaultMode]);
 
   // Toggle Private Mode on an existing tab
   const handleTogglePrivateTab = useCallback((tabId: string) => {
@@ -413,6 +426,17 @@ export default function App() {
   }, [activeTabId]);
 
   // Proxy Mode Toggle (Proxy vs Direct)
+  // "My own connection" loads sites from this browser (direct); anything else goes through the server/proxy.
+  const handleSetConnection = useCallback(
+    (connection: 'direct' | 'proxy') => {
+      setSettings((prev) => ({ ...prev, defaultMode: connection }));
+      setTabs((prev) =>
+        prev.map((t) => (t.id === activeTabId && t.mode !== 'reader' ? { ...t, mode: connection } : t)),
+      );
+    },
+    [activeTabId],
+  );
+
   const handleToggleProxyMode = useCallback(() => {
     setTabs((prev) =>
       prev.map((t) => {
@@ -655,6 +679,8 @@ export default function App() {
         onClose={() => setIsSettingsOpen(false)}
         settings={settings}
         onUpdateSettings={handleUpdateSettings}
+        connection={activeTab?.mode === 'direct' ? 'direct' : 'proxy'}
+        onSetConnection={handleSetConnection}
       />
 
       {/* 9. Private Session Wiped Toast */}
