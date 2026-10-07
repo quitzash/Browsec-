@@ -3,7 +3,9 @@ import type { Request, Response } from 'express';
 import * as cheerio from 'cheerio';
 import dotenv from 'dotenv';
 import { ProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
+import { Readable } from 'stream';
 import { getRankedProxies } from './proxy-scanner.ts';
+import { buildClientShim, rewriteCss, rewriteHtmlResources, rewriteJsImports } from './proxy-rewrite.ts';
 
 dotenv.config();
 
@@ -171,8 +173,11 @@ function persistJar(res: Response, name: string, value: string, isPrivate: boole
 export function createApiApp(): express.Express {
   const app = express();
 
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: true }));
+  const keepRawBody = (req: any, _res: any, buf: Buffer) => {
+    req.rawBody = buf;
+  };
+  app.use(express.json({ limit: '10mb', verify: keepRawBody }));
+  app.use(express.urlencoded({ extended: true, limit: '10mb', verify: keepRawBody }));
 
   app.post('/api/session/clear', (req: Request, res: Response) => {
     const tabId = ((req.query.tabId || req.body?.tabId) as string) || '';
@@ -460,6 +465,17 @@ export function createApiApp(): express.Express {
     let targetUrl = validation.url;
     const tabId = (req.query.tabId as string) || '';
     const isPrivate = req.query.isPrivate === 'true';
+    const rewriteCtx = { tabId, isPrivate };
+    // Browsers label every request with what it is for; only real documents get interstitials and the injected bridge.
+    const dest = String(req.headers['sec-fetch-dest'] || 'document').toLowerCase();
+    const isDocument = ['document', 'iframe', 'frame', 'embed', 'object'].includes(dest);
+
+    if (req.method === 'OPTIONS') {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', String(req.headers['access-control-request-headers'] || '*'));
+      return res.status(204).end();
+    }
     const jarName = tabId ? jarCookieName(tabId) : '';
     const existingJar = jarName ? decodeURIComponent(readCookie(req, jarName)) : '';
 
@@ -474,36 +490,68 @@ export function createApiApp(): express.Express {
     } catch {}
 
     try {
-      const forwardHeaders: Record<string, string> = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
-      };
+      const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+      const targetOrigin = new URL(targetUrl).origin;
+      const forwardHeaders: Record<string, string> = isDocument
+        ? {
+            'User-Agent': UA,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+          }
+        : {
+            'User-Agent': UA,
+            'Accept': String(req.headers.accept || '*/*'),
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': `${targetOrigin}/`,
+          };
 
+      if (!isDocument && req.headers.range) {
+        forwardHeaders['Range'] = String(req.headers.range);
+      }
       if (existingJar) {
         forwardHeaders['Cookie'] = existingJar;
       }
 
+      const method = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) ? req.method : 'GET';
+      let body: Buffer | undefined;
+      if (method !== 'GET' && method !== 'HEAD') {
+        const contentTypeIn = String(req.headers['content-type'] || '');
+        if (contentTypeIn) forwardHeaders['Content-Type'] = contentTypeIn;
+        forwardHeaders['Origin'] = targetOrigin;
+        body = (req as any).rawBody as Buffer | undefined;
+        if (!body) {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(Buffer.from(chunk));
+          body = Buffer.concat(chunks);
+        }
+      }
+
+      // Time out waiting for response headers only, so long media streams are not cut off mid-playback.
+      const controller = new AbortController();
+      const headerTimer = setTimeout(() => controller.abort(), 18000);
+      res.on('close', () => controller.abort());
+
       const fetchOptions: RequestInit = {
-        method: req.method === 'POST' ? 'POST' : 'GET',
+        method,
         headers: forwardHeaders,
+        body: body as any,
         redirect: 'follow',
-        signal: AbortSignal.timeout(18000),
+        signal: controller.signal,
       };
 
-      const response = await fetch(targetUrl, fetchOptions);
+      const response = await fetch(targetUrl, fetchOptions).finally(() => clearTimeout(headerTimer));
       const finalUrl = response.url;
       const contentType = response.headers.get('content-type') || '';
 
-      if (response.status === 401 || response.status === 403) {
+      if (isDocument && (response.status === 401 || response.status === 403)) {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.status(200).send(`
           <!DOCTYPE html>
@@ -613,7 +661,7 @@ export function createApiApp(): express.Express {
       }
 
       const setCookieHeader = response.headers.get('set-cookie');
-      if (setCookieHeader && jarName) {
+      if (setCookieHeader && jarName && (isDocument || dest === 'empty')) {
         const firstPair = setCookieHeader.split(';')[0];
         const combined = existingJar ? `${existingJar}; ${firstPair}` : firstPair;
         persistJar(res, jarName, combined, isPrivate);
@@ -630,7 +678,7 @@ export function createApiApp(): express.Express {
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       res.setHeader('X-Proxy-Target-Url', finalUrl);
 
-      if (contentType.includes('text/html')) {
+      if (isDocument && contentType.includes('text/html')) {
         const htmlText = await response.text();
         const $ = cheerio.load(htmlText);
 
@@ -715,11 +763,18 @@ export function createApiApp(): express.Express {
 
         $('meta[http-equiv="refresh"]').remove();
 
-        if ($('base').length === 0) {
-          $('head').prepend(`<base href="${finalUrl}">`);
-        } else {
-          $('base').first().attr('href', finalUrl);
+        // Honour a <base href> the page already declares, then pin it to an absolute URL.
+        let docBase = finalUrl;
+        const declaredBase = $('base[href]').first().attr('href');
+        if (declaredBase) {
+          try {
+            docBase = new URL(declaredBase, finalUrl).toString();
+          } catch {}
         }
+        $('base').remove();
+
+        rewriteHtmlResources($, docBase, rewriteCtx);
+        $('head').prepend(`<base href="${docBase}">${buildClientShim(rewriteCtx)}`);
 
         const bridgeScript = `
         <script id="__apex_browser_bridge__">
@@ -816,12 +871,43 @@ export function createApiApp(): express.Express {
 
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.send($.html());
-      } else {
-        res.setHeader('Content-Type', contentType);
-        const buffer = await response.arrayBuffer();
-        return res.send(Buffer.from(buffer));
       }
+
+      // Subresources, API calls and non-HTML documents.
+      if (!isDocument && response.ok) {
+        res.setHeader('Cache-Control', 'public, max-age=600');
+      }
+
+      if (/text\/css/i.test(contentType)) {
+        const css = await response.text();
+        res.setHeader('Content-Type', 'text/css; charset=utf-8');
+        return res.status(response.status).send(rewriteCss(css, finalUrl, rewriteCtx));
+      }
+
+      if (/javascript|ecmascript/i.test(contentType)) {
+        const js = await response.text();
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        return res.status(response.status).send(rewriteJsImports(js, finalUrl, rewriteCtx));
+      }
+
+      res.setHeader('Content-Type', contentType || 'application/octet-stream');
+      for (const name of ['content-range', 'accept-ranges', 'etag', 'last-modified']) {
+        const value = response.headers.get(name);
+        if (value) res.setHeader(name, value);
+      }
+      if (!response.headers.get('content-encoding')) {
+        const length = response.headers.get('content-length');
+        if (length) res.setHeader('Content-Length', length);
+      }
+      res.status(response.status);
+      if (!response.body || method === 'HEAD') return res.end();
+      const stream = Readable.fromWeb(response.body as any);
+      stream.on('error', () => res.destroy());
+      return stream.pipe(res);
     } catch (err: any) {
+      if (!isDocument) {
+        return res.status(502).type('text/plain').send(`Proxy fetch failed: ${err?.message || 'unknown error'}`);
+      }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       const proxyRetryButton = upstream.enabled && !upstream.error
         ? `<button class="btn-secondary" onclick="fetch('/api/network?enabled=false', {method: 'POST'}).then(function () { window.parent.location.reload(); })">Retry Without Upstream Proxy</button>`
