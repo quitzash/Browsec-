@@ -1107,16 +1107,6 @@ export function createApiApp(): express.Express {
             redirects.push({ url: new URL(match[2].trim(), finalUrl).toString(), delayMs: Math.min(60, Number(match[1] || 0)) * 1000 });
           } catch {}
         });
-        $('script:not([src])').each((_, el) => {
-          const code = $(el).html() || '';
-          if (code.length > 800) return;
-          const match = code.match(/(?:window\.)?(?:parent\.|top\.)?location(?:\.href\s*=|\.replace\(|\.assign\(|\s*=)\s*(['"])([^'"]+)\1/);
-          if (!match) return;
-          try {
-            redirects.push({ url: new URL(match[2], finalUrl).toString(), delayMs: 0 });
-            $(el).remove();
-          } catch {}
-        });
         $('meta[http-equiv="refresh"]').remove();
 
         // Honour a <base href> the page already declares, then pin it to an absolute URL.
@@ -1128,6 +1118,30 @@ export function createApiApp(): express.Express {
           } catch {}
         }
         $('base').remove();
+
+        // Inline scripts that navigate: rewrite only the navigation call, in place, so the rest of the
+        // script still runs (storage writes, state setup, timers) and keeps its own timing. Deleting the
+        // whole script would destroy page logic; letting a cross-origin navigation run would leave this
+        // app's origin. JSON/template data blocks are never touched.
+        const navCallPattern =
+          /(?:(?:window|document)\.)?(?:parent\.|top\.)?location(?:(?:\.replace|\.assign)\s*\(\s*(['"])([^'"]+)\1\s*\)|(?:\.href\s*=|\s*=)\s*(['"])([^'"]+)\3)/g;
+        const executableScriptType = /^(?:text|application)\/(?:x-)?javascript$|^module$|^text\/ecmascript$|^application\/ecmascript$/;
+        $('script:not([src])').each((_, el) => {
+          const type = (($(el).attr('type') || '') as string).trim().toLowerCase();
+          if (type && !executableScriptType.test(type)) return;
+          const source = $(el).text();
+          if (!/location\s*(?:\.href\s*=|\.replace\s*\(|\.assign\s*\(|\s*=)/.test(source)) return;
+          const rewritten = source.replace(navCallPattern, (matched, _q1, callUrl, _q2, assignUrl) => {
+            try {
+              const target = new URL(String(callUrl ?? assignUrl), docBase);
+              if (target.protocol !== 'http:' && target.protocol !== 'https:') return matched;
+              return `window.parent.postMessage({ type: 'APEX_NAVIGATE_TO', url: ${JSON.stringify(target.toString()).replace(/</g, '\\u003c')} }, '*')`;
+            } catch {
+              return matched;
+            }
+          });
+          if (rewritten !== source) $(el).text(rewritten);
+        });
 
         rewriteHtmlResources($, docBase, rewriteCtx);
         // Hand the page its own site's storage and non-HttpOnly cookies inline (site scripts read

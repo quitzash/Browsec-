@@ -137,7 +137,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         if (cancelled || !data.warp) return;
         setWarp(data.warp);
         if (!data.warp.supported) setService('free');
-        else if (data.proxy?.active && data.proxy.provider === 'free') setService('free');
+        else if (data.proxy?.active && data.proxy.provider !== 'warp') setService('free');
       })
       .catch(() => {});
     fetch('/api/logins')
@@ -299,7 +299,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           return;
         }
       }
-      setLocMsg(`Found VPN servers listed for ${countryName(code)}, but none passed the check just now. Try again.`);
+      const stillOn = egress ? describeGeo(egress) || countryName(egress.countryCode) : '';
+      setLocMsg(`Found VPN servers listed for ${countryName(code)}, but none passed the check just now. Try again, or pick a nearby country.${stillOn ? ` You're still on ${stillOn}.` : ''}`);
     } catch {
       setLocMsg('Connecting failed. Check your connection and try again.');
     } finally {

@@ -386,6 +386,16 @@ const SHIM_SOURCE = String.raw`
       catch (e) { return native.call(history, state, title); }
     };
   });
+
+  // A message posted to window.parent stops at the direct parent, so navigation requests started
+  // inside a nested frame never reach the app's chrome on their own — pass them up the frame tree.
+  window.addEventListener('message', function (e) {
+    var d = e && e.data;
+    if (!d || window.parent === window) return;
+    if (d.type === 'APEX_NAVIGATE_TO' || d.type === 'APEX_NAVIGATE_REL') {
+      window.parent.postMessage(d, '*');
+    }
+  });
 })();
 `;
 
