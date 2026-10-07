@@ -5,10 +5,13 @@ import dotenv from 'dotenv';
 import { Agent, ProxyAgent, fetch as undiciFetch, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import net from 'net';
 import { Readable } from 'stream';
-import { createHash } from 'crypto';
+import { createHash, createHmac, randomBytes } from 'crypto';
 import { getRankedProxies, lookupExit } from './proxy-scanner.ts';
+import { connectWarp, setWarpExitHandler, stopWarp, warpStatus } from './warp.ts';
 import { AssetCache, Semaphore, pageUrlFromReferer, sendText, type CachedAsset } from './proxy-perf.ts';
 import { buildClientShim, rewriteCss, rewriteHtmlResources, rewriteJsImports } from './proxy-rewrite.ts';
+import { cookieHeaderFor, forgetSavedLogins, forgetTab, pageCookiesFor, savedLoginSummary, storeSetCookies, type JarScope } from './cookie-store.ts';
+import { forgetTab as forgetTabStorage, forgetSavedStorage, readStorage, writeStorage } from './web-storage.ts';
 
 dotenv.config();
 
@@ -21,12 +24,18 @@ const defaultDispatcher = getGlobalDispatcher();
 const upstreamGate = new Semaphore(Math.max(1, Number(process.env.UPSTREAM_MAX_CONCURRENCY) || 8));
 const assetCache = new AssetCache();
 
+type FetchResponse = Awaited<ReturnType<typeof fetch>>;
+
 type ProxyTestResult = { ok: boolean; latencyMs: number | null; error: string | null; checkedAt: number };
+
+type VpnProvider = 'warp' | 'free' | 'custom' | 'none';
 
 interface UpstreamProxyState {
   enabled: boolean;
   url: string;
   source: 'env' | 'runtime' | 'none';
+  /** Which VPN service is behind the upstream address. */
+  provider: VpnProvider;
   error: string | null;
   lastTest: ProxyTestResult | null;
 }
@@ -35,6 +44,7 @@ const upstream: UpstreamProxyState = {
   enabled: false,
   url: '',
   source: 'none',
+  provider: 'none',
   error: null,
   lastTest: null,
 };
@@ -52,7 +62,7 @@ function maskProxyUrl(value: string): string {
 function applyUpstreamProxy(): void {
   if (upstream.enabled && !upstream.url) {
     upstream.enabled = false;
-    upstream.error = 'A proxy URL is required to enable proxy mode';
+    upstream.error = 'A VPN server address is required to connect';
     setGlobalDispatcher(defaultDispatcher);
     return;
   }
@@ -66,20 +76,32 @@ function applyUpstreamProxy(): void {
   try {
     const parsed = new URL(upstream.url);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error('Proxy URL must start with http:// or https://');
+      throw new Error('The VPN server address must start with http:// or https://');
     }
     setGlobalDispatcher(new ProxyAgent(upstream.url));
     upstream.error = null;
   } catch (err: any) {
-    upstream.error = err?.message || 'Invalid proxy configuration';
+    upstream.error = err?.message || 'Invalid VPN server address';
     setGlobalDispatcher(defaultDispatcher);
   }
 }
+
+// If the WARP tunnel dies, stop sending traffic into a dead local port.
+setWarpExitHandler(() => {
+  if (upstream.provider !== 'warp') return;
+  upstream.enabled = false;
+  upstream.url = '';
+  upstream.source = 'none';
+  upstream.provider = 'none';
+  upstream.error = null;
+  applyUpstreamProxy();
+});
 
 const envProxyUrl = process.env.UPSTREAM_PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
 if (envProxyUrl) {
   upstream.url = envProxyUrl;
   upstream.source = 'env';
+  upstream.provider = 'custom';
   upstream.enabled = process.env.UPSTREAM_PROXY_ENABLED !== 'false';
   applyUpstreamProxy();
 }
@@ -112,6 +134,7 @@ function proxyStatus() {
     enabled: upstream.enabled,
     url: upstream.url ? maskProxyUrl(upstream.url) : '',
     source: upstream.source,
+    provider: upstream.provider,
     error: upstream.error,
     active: upstream.enabled && !upstream.error,
     lastTest: upstream.lastTest,
@@ -135,15 +158,18 @@ function sanitizeAndValidateUrl(inputUrl: string): { valid: boolean; url?: strin
     }
 
     const hostname = parsed.hostname.toLowerCase();
-    if (
+    // Opt-in for development: APEX_ALLOW_LOCAL=1 lets the browser reach addresses on this machine
+    // (a local dev server, a test fixture). Blocked by default so a hostile page cannot scan the LAN.
+    const allowLocal = process.env.APEX_ALLOW_LOCAL === '1';
+    const isLocalAddress =
       hostname === 'localhost' ||
       hostname === '127.0.0.1' ||
       hostname === '0.0.0.0' ||
       hostname === '169.254.169.254' ||
       hostname.startsWith('10.') ||
       hostname.startsWith('192.168.') ||
-      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname)
-    ) {
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname);
+    if (isLocalAddress && !allowLocal) {
       return { valid: false, error: 'Access to private or local network hosts is restricted.' };
     }
 
@@ -213,31 +239,34 @@ async function checkFrameable(rawUrl: string): Promise<{ frameable: boolean; rea
   return result;
 }
 
-function jarCookieName(tabId: string): string {
-  return `apex_jar_${tabId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+// Page script reports what its site stored and any document.cookie assignment. It cannot be trusted
+// to name its own site: every proxied site shares this app's single origin in the browser. Each
+// document therefore gets a token bound to its real origin and tab and signed with a per-process
+// secret; the server derives the site from the token, so one site can never write into another
+// site's storage or cookie jar.
+const storageSecret = randomBytes(32);
+
+interface StorageSite {
+  origin: string;
+  tabId: string;
+  isPrivate: boolean;
 }
 
-function readCookie(req: Request, name: string): string {
-  const header = req.headers.cookie;
-  if (!header) return '';
-  for (const part of header.split(';')) {
-    const separator = part.indexOf('=');
-    if (separator === -1) continue;
-    if (part.slice(0, separator).trim() === name) {
-      return part.slice(separator + 1).trim();
-    }
-  }
-  return '';
+function signStorage(site: StorageSite): string {
+  return createHmac('sha256', storageSecret).update(`${site.origin}\n${site.tabId}\n${site.isPrivate ? 1 : 0}`).digest('hex');
 }
 
-function persistJar(res: Response, name: string, value: string, isPrivate: boolean): void {
-  if (!value || value.length > 3000) return;
-  res.cookie(name, value, {
-    httpOnly: true,
-    sameSite: 'lax',
-    path: '/',
-    ...(isPrivate ? {} : { maxAge: 7 * 24 * 60 * 60 * 1000 }),
-  });
+function verifyStorage(body: Record<string, any>): StorageSite | null {
+  const site: StorageSite = {
+    origin: String(body.origin || ''),
+    tabId: String(body.tabId || ''),
+    isPrivate: body.isPrivate === true || body.isPrivate === 'true',
+  };
+  if (!/^https?:\/\/[^/\s]+$/.test(site.origin)) return null;
+  const claimed = String(body.token || '');
+  const expected = signStorage(site);
+  if (claimed.length !== expected.length) return null;
+  return site;
 }
 
 export function createApiApp(): express.Express {
@@ -251,14 +280,46 @@ export function createApiApp(): express.Express {
 
   app.post('/api/session/clear', (req: Request, res: Response) => {
     const tabId = ((req.query.tabId || req.body?.tabId) as string) || '';
+    const forgetAll = String(req.query.all ?? req.body?.all ?? '') === 'true';
+    if (forgetAll) {
+      void forgetSavedLogins();
+      void forgetSavedStorage();
+    }
     if (tabId) {
-      res.clearCookie(jarCookieName(tabId), { path: '/' });
-      console.log(`[Private Session] Cleared session cookies and storage for tab: ${tabId}`);
+      // A closed (or de-privatised) tab loses its in-memory session data. Saved logins from regular
+      // tabs live on the device and are not touched here.
+      forgetTab(tabId);
+      forgetTabStorage(tabId);
+      console.log(`[Session] Dropped in-memory storage for tab: ${tabId}${forgetAll ? ' and all saved logins' : ''}`);
     }
     return res.json({ success: true, message: `Session for tab ${tabId || 'unknown'} cleared.` });
   });
 
+  // What a proxied page's script saved: localStorage for its site (and sessionStorage for its tab),
+  // plus any document.cookie assignments, all written to this device.
+  app.post('/api/storage', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, any>;
+    const site = verifyStorage(body);
+    if (!site) return res.status(403).json({ error: 'Invalid storage token' });
+    if (body.local !== undefined || body.session !== undefined) {
+      void writeStorage(site, { local: body.local, session: body.session });
+    }
+    const cookies = Array.isArray(body.cookies)
+      ? body.cookies.filter((c: unknown): c is string => typeof c === 'string' && c.length > 0 && c.length <= 4096).slice(0, 30)
+      : [];
+    if (cookies.length) void storeSetCookies(site.origin, cookies, { isPrivate: site.isPrivate, tabId: site.tabId });
+    return res.json({ ok: true });
+  });
+
+  // How many logins are stored on this device, for the Settings panel.
+  app.get('/api/logins', async (_req: Request, res: Response) => {
+    res.json({ logins: await savedLoginSummary() });
+  });
+
   app.get('/api/network', async (req: Request, res: Response) => {
+    if (req.query.warp === 'true') {
+      return res.json({ warp: warpStatus(), proxy: proxyStatus() });
+    }
     if (req.query.frameable === 'true') {
       return res.json(await checkFrameable(String(req.query.url || '')));
     }
@@ -286,7 +347,44 @@ export function createApiApp(): express.Express {
     const rawTest = body.test ?? query.test;
     const rawRevert = body.revertOnFail ?? query.revertOnFail;
     const rawExpectCountry = body.expectCountry ?? query.expectCountry;
-    const previous = { url: upstream.url, enabled: upstream.enabled, source: upstream.source };
+    const rawWarp = body.warp ?? query.warp;
+    const rawProvider = body.provider ?? query.provider;
+    const previous = { url: upstream.url, enabled: upstream.enabled, source: upstream.source, provider: upstream.provider };
+    const restorePrevious = () => {
+      upstream.url = previous.url;
+      upstream.enabled = previous.enabled;
+      upstream.source = previous.source;
+      upstream.provider = previous.provider;
+      applyUpstreamProxy();
+    };
+
+    if (rawWarp === 'connect') {
+      try {
+        const { url } = await connectWarp();
+        upstream.url = url;
+        upstream.enabled = true;
+        upstream.source = 'runtime';
+        upstream.provider = 'warp';
+        applyUpstreamProxy();
+        upstream.lastTest = await runProxyTest();
+        const egress = await lookupExit(null, 9000);
+        return res.json({ proxy: proxyStatus(), warp: warpStatus(), egress });
+      } catch (err: any) {
+        restorePrevious();
+        return res.status(502).json({ error: err?.message || 'Could not connect to Cloudflare WARP', proxy: proxyStatus(), warp: warpStatus() });
+      }
+    }
+    if (rawWarp === 'disconnect') {
+      await stopWarp();
+      if (upstream.provider === 'warp') {
+        upstream.enabled = false;
+        upstream.url = '';
+        upstream.source = 'none';
+        upstream.provider = 'none';
+        applyUpstreamProxy();
+      }
+      return res.json({ proxy: proxyStatus(), warp: warpStatus() });
+    }
 
     if (typeof rawUrl === 'string') {
       const next = rawUrl.trim();
@@ -294,6 +392,7 @@ export function createApiApp(): express.Express {
         upstream.url = '';
         upstream.enabled = false;
         upstream.source = 'none';
+        upstream.provider = 'none';
       } else if (next.includes('****') && upstream.url) {
         try {
           const incoming = new URL(next);
@@ -308,6 +407,7 @@ export function createApiApp(): express.Express {
       } else {
         upstream.url = next;
         upstream.source = 'runtime';
+        upstream.provider = rawProvider === 'free' ? 'free' : 'custom';
       }
     }
 
@@ -318,17 +418,27 @@ export function createApiApp(): express.Express {
       if (enabled) upstream.source = upstream.source === 'env' ? 'env' : 'runtime';
     }
 
+    // Turning the VPN off while it is WARP means stopping the tunnel, not leaving a helper process running.
+    if (upstream.provider === 'warp' && !upstream.enabled) {
+      await stopWarp();
+      upstream.url = '';
+      upstream.source = 'none';
+      upstream.provider = 'none';
+    }
+
     applyUpstreamProxy();
+
+    // Once the user has moved to a different server, the WARP tunnel is no longer needed.
+    const releaseWarpIfReplaced = async () => {
+      if (previous.provider === 'warp' && upstream.provider !== 'warp') await stopWarp();
+    };
 
     if (rawTest === true || rawTest === 'true') {
       upstream.lastTest = await runProxyTest();
       // Picking a proxy from the list must not leave the app on one that just stopped responding.
       if (!upstream.lastTest.ok && (rawRevert === true || rawRevert === 'true')) {
         const failed = upstream.lastTest;
-        upstream.url = previous.url;
-        upstream.enabled = previous.enabled;
-        upstream.source = previous.source;
-        applyUpstreamProxy();
+        restorePrevious();
         upstream.lastTest = failed;
         return res.json({ proxy: proxyStatus(), reverted: true });
       }
@@ -339,19 +449,18 @@ export function createApiApp(): express.Express {
       const expected = rawExpectCountry.toUpperCase();
       const exit = await lookupExit(null, 9000);
       if (!exit || exit.countryCode !== expected) {
-        upstream.url = previous.url;
-        upstream.enabled = previous.enabled;
-        upstream.source = previous.source;
-        applyUpstreamProxy();
+        restorePrevious();
         return res.json({
           proxy: proxyStatus(),
           reverted: true,
           reason: exit ? `exits in ${exit.country || exit.countryCode}, not ${expected}` : 'could not verify where it exits',
         });
       }
+      await releaseWarpIfReplaced();
       return res.json({ proxy: proxyStatus(), egress: exit });
     }
 
+    await releaseWarpIfReplaced();
     return res.json({ proxy: proxyStatus() });
   });
 
@@ -589,10 +698,10 @@ export function createApiApp(): express.Express {
       res.setHeader('Access-Control-Allow-Headers', String(req.headers['access-control-request-headers'] || '*'));
       return res.status(204).end();
     }
-    const jarName = tabId ? jarCookieName(tabId) : '';
-    const existingJar = jarName ? decodeURIComponent(readCookie(req, jarName)) : '';
-
-
+    // Cookies come from the jar saved on this device, keyed by the real site's domain and rules.
+    // The browser's own cookies are never forwarded: it only knows this app's one origin for all sites.
+    const scope: JarScope = { isPrivate, tabId };
+    let cookieHeader = await cookieHeaderFor(targetUrl, scope);
 
     try {
       const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -629,8 +738,8 @@ export function createApiApp(): express.Express {
       if (!isDocument && req.headers.range) {
         forwardHeaders['Range'] = String(req.headers.range);
       }
-      if (existingJar) {
-        forwardHeaders['Cookie'] = existingJar;
+      if (cookieHeader) {
+        forwardHeaders['Cookie'] = cookieHeader;
       }
 
       const method = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) ? req.method : 'GET';
@@ -650,7 +759,7 @@ export function createApiApp(): express.Express {
       // Static assets: serve repeats from memory instead of going back through a slow upstream proxy.
       const cacheable = !isDocument && method === 'GET' && !req.headers.range && ['style', 'script', 'image', 'font'].includes(dest);
       const cacheKey = cacheable
-        ? `${targetUrl}|${existingJar ? createHash('sha1').update(existingJar).digest('hex') : ''}`
+        ? `${targetUrl}|${cookieHeader ? createHash('sha1').update(cookieHeader).digest('hex') : ''}`
         : '';
 
       const emitAsset = async (asset: CachedAsset, state: 'hit' | 'miss') => {
@@ -687,34 +796,92 @@ export function createApiApp(): express.Express {
 
       // Time out waiting for response headers only, so long media streams are not cut off mid-playback.
       const controller = new AbortController();
-      const headerTimer = setTimeout(() => controller.abort(), 18000);
       res.on('close', () => controller.abort());
 
-      const fetchOptions: RequestInit = {
-        method,
-        headers: forwardHeaders,
-        body: body as any,
-        redirect: 'follow',
-        signal: controller.signal,
+      const getSetCookies = (r: FetchResponse): string[] => {
+        const headers = r.headers as any;
+        if (typeof headers.getSetCookie === 'function') return headers.getSetCookie() || [];
+        const single = r.headers.get('set-cookie');
+        return single ? [single] : [];
       };
 
-      // Free proxies and busy hosts drop connections now and then; an idempotent request is safe to retry once.
-      let response: Awaited<ReturnType<typeof fetch>>;
+      // Follow redirects by hand. fetch() internally swallows Set-Cookie from intermediate hops, and
+      // a login normally sets its session cookie on a 302 on the way to the page it lands on — so
+      // each hop's cookies go into this device's jar and the next hop sends them back, the way a
+      // browser does. Redirects are also re-cookie'd, and a POST that a 302 turns into a GET.
+      const followRedirects = async (): Promise<{ response: FetchResponse; url: string }> => {
+        const startCookies = await cookieHeaderFor(targetUrl, scope);
+        if (startCookies) forwardHeaders['Cookie'] = startCookies;
+        else delete forwardHeaders['Cookie'];
+        let hopUrl = targetUrl;
+        let hopMethod = method;
+        let hopBody = body;
+        for (let hop = 0; hop < 20; hop++) {
+          const headerTimer = setTimeout(() => controller.abort(), 18000);
+          let hopResponse: FetchResponse;
+          try {
+            hopResponse = await fetch(hopUrl, {
+              method: hopMethod,
+              headers: forwardHeaders,
+              body: hopBody as any,
+              redirect: 'manual',
+              signal: controller.signal,
+            });
+          } finally {
+            clearTimeout(headerTimer);
+          }
+          const setCookies = getSetCookies(hopResponse);
+          if (setCookies.length) {
+            sawSetCookie = true;
+            await storeSetCookies(hopUrl, setCookies, scope);
+          }
+          const location = hopResponse.headers.get('location');
+          if (hopResponse.status < 300 || hopResponse.status >= 400 || !location) {
+            return { response: hopResponse, url: hopUrl };
+          }
+          let next: URL;
+          try {
+            next = new URL(location, hopUrl);
+          } catch {
+            return { response: hopResponse, url: hopUrl };
+          }
+          if (next.protocol !== 'http:' && next.protocol !== 'https:') return { response: hopResponse, url: hopUrl };
+          // Browser semantics: 301/302/303 turn a POST into a GET (dropping its body); 307/308 replay it.
+          if (hopResponse.status !== 307 && hopResponse.status !== 308 && hopMethod !== 'GET' && hopMethod !== 'HEAD') {
+            hopMethod = 'GET';
+            hopBody = undefined;
+            delete forwardHeaders['Content-Type'];
+            if (!pageUrl) forwardHeaders['Origin'] = next.origin;
+          }
+          const nextCookies = await cookieHeaderFor(next.toString(), scope);
+          if (nextCookies) forwardHeaders['Cookie'] = nextCookies;
+          else delete forwardHeaders['Cookie'];
+          hopResponse.body?.cancel?.().catch(() => {});
+          hopUrl = next.toString();
+        }
+        throw new Error('Too many redirects');
+      };
+
+      let sawSetCookie = false;
+      let fetched: { response: FetchResponse; url: string };
       try {
-        response = await fetch(targetUrl, fetchOptions);
-      } catch (firstError: any) {
-        if ((method !== 'GET' && method !== 'HEAD') || controller.signal.aborted) throw firstError;
-        response = await fetch(targetUrl, fetchOptions);
+        try {
+          fetched = await followRedirects();
+        } catch (firstError: any) {
+          // Free proxies and busy hosts drop connections now and then; an idempotent request is safe to retry once.
+          if ((method !== 'GET' && method !== 'HEAD') || controller.signal.aborted) throw firstError;
+          fetched = await followRedirects();
+        }
       } finally {
-        clearTimeout(headerTimer);
         // The gate limits connection setup to a flaky proxy; once headers are back the slot is free again,
         // so long-lived bodies (streams, long-polling) don't hold up the rest of the page.
         releaseGate?.();
       }
-      const finalUrl = response.url;
+      const response = fetched.response;
+      const finalUrl = fetched.url;
       const contentType = response.headers.get('content-type') || '';
 
-      if (cacheKey && response.status === 200 && Number(response.headers.get('content-length') || 0) <= assetCache.maxItemBytes) {
+      if (cacheKey && !sawSetCookie && response.status === 200 && Number(response.headers.get('content-length') || 0) <= assetCache.maxItemBytes) {
         const body = Buffer.from(await response.arrayBuffer());
         const extra: Record<string, string> = {};
         for (const name of ['etag', 'last-modified']) {
@@ -815,12 +982,12 @@ export function createApiApp(): express.Express {
             <body>
               <div class="card">
                 <div class="badge">HTTP ${response.status} Host Restriction</div>
-                <h1>Cloud Proxy Restriction</h1>
-                <p>This destination website enforces strict anti-proxy controls that block datacenter IP addresses from rendering its pages.</p>
+                <h1>Blocked by this site</h1>
+                <p>This website blocks VPN and datacenter addresses from loading its pages.</p>
                 <div class="url-box">${targetUrl}</div>
                 <div class="actions">
                   <button class="btn-primary" onclick="window.parent.postMessage({type: 'APEX_SWITCH_TO_DIRECT'}, '*')">
-                    Switch to Direct Mode (Bypasses Proxy)
+                    Switch to Direct Mode (bypasses the VPN)
                   </button>
                   <button class="btn-secondary" onclick="window.parent.postMessage({type: 'APEX_NAVIGATE_TO', url: 'https://duckduckgo.com'}, '*')">
                     Open DuckDuckGo Search
@@ -833,13 +1000,6 @@ export function createApiApp(): express.Express {
             </body>
           </html>
         `);
-      }
-
-      const setCookieHeader = response.headers.get('set-cookie');
-      if (setCookieHeader && jarName && (isDocument || dest === 'empty')) {
-        const firstPair = setCookieHeader.split(';')[0];
-        const combined = existingJar ? `${existingJar}; ${firstPair}` : firstPair;
-        persistJar(res, jarName, combined, isPrivate);
       }
 
       res.removeHeader('X-Frame-Options');
@@ -864,7 +1024,7 @@ export function createApiApp(): express.Express {
             <html>
               <head>
                 <meta charset="utf-8">
-                <title>Search Provider Proxy Notice</title>
+                <title>Search Provider Notice</title>
                 <style>
                   body {
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -907,8 +1067,8 @@ export function createApiApp(): express.Express {
               </head>
               <body>
                 <div class="card">
-                  <h1>Google Search Proxy Notice</h1>
-                  <p>Google blocks datacenter cloud proxies from loading its search results directly. Switch to DuckDuckGo for unrestricted live web search, or view Google in Direct Mode.</p>
+                  <h1>Google blocks VPN searches</h1>
+                  <p>Google blocks VPN and datacenter addresses from loading its search results. Switch to DuckDuckGo for unrestricted live web search, or view Google in Direct Mode.</p>
                   <div class="actions">
                     <button class="btn-primary" onclick="window.parent.postMessage({type: 'APEX_NAVIGATE_TO', url: 'https://duckduckgo.com'}, '*')">
                       Search with DuckDuckGo
@@ -970,7 +1130,18 @@ export function createApiApp(): express.Express {
         $('base').remove();
 
         rewriteHtmlResources($, docBase, rewriteCtx);
-        $('head').prepend(`<base href="${docBase}">${buildClientShim(rewriteCtx, docBase, finalUrl)}`);
+        // Hand the page its own site's storage and non-HttpOnly cookies inline (site scripts read
+        // them on the first line); the shim writes changes back to this device through /api/storage.
+        const pageSite: StorageSite = { origin: new URL(finalUrl).origin, tabId, isPrivate };
+        const pageStorage = await readStorage(pageSite);
+        const docCookies = await pageCookiesFor(finalUrl, scope);
+        $('head').prepend(
+          `<base href="${docBase}">${buildClientShim(rewriteCtx, docBase, finalUrl, {
+            ...pageStorage,
+            docCookies,
+            token: signStorage(pageSite),
+          })}`,
+        );
 
         const bridgeScript = `
         <script id="__apex_browser_bridge__">
@@ -1118,11 +1289,11 @@ export function createApiApp(): express.Express {
     } catch (err: any) {
       console.warn(`[proxy] ${req.method} ${targetUrl} failed: ${err?.message}${err?.cause ? ` (${err.cause.code || err.cause.message})` : ''}`);
       if (!isDocument) {
-        return res.status(502).type('text/plain').send(`Proxy fetch failed: ${err?.message || 'unknown error'}`);
+        return res.status(502).type('text/plain').send(`VPN fetch failed: ${err?.message || 'unknown error'}`);
       }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       const proxyRetryButton = upstream.enabled && !upstream.error
-        ? `<button class="btn-secondary" onclick="fetch('/api/network?enabled=false', {method: 'POST'}).then(function () { window.parent.location.reload(); })">Retry Without Upstream Proxy</button>`
+        ? `<button class="btn-secondary" onclick="fetch('/api/network?enabled=false', {method: 'POST'}).then(function () { window.parent.location.reload(); })">Retry Without VPN Server</button>`
         : '';
       return res.status(502).send(`
         <!DOCTYPE html>
@@ -1223,7 +1394,7 @@ export function createApiApp(): express.Express {
             <div class="card">
               <div class="icon">✕</div>
               <h1>Unable to load website</h1>
-              <p>Apex Browser proxy could not establish a connection to the requested address. The host might be unreachable, blocking automated proxies, or the connection timed out.</p>
+              <p>Apex VPN could not establish a connection to the requested address. The host might be unreachable, blocking VPN addresses, or the connection timed out.</p>
               <div class="meta">${targetUrl}</div>
               <div class="actions">
                 <button class="btn-primary" onclick="window.location.reload()">Try Again</button>

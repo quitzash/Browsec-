@@ -290,10 +290,12 @@ export default function App() {
 
     // Check if the tab being closed is a Private Tab
     const tabToClose = tabs.find((t) => t.id === tabId);
-    if (tabToClose?.isPrivate) {
-      // 1. Clear isolated session cookies and proxy storage on the server
-      fetch(`/api/session/clear?tabId=${encodeURIComponent(tabId)}`, { method: 'POST' }).catch(() => {});
 
+    // 1. Drop the tab's in-memory server state (its sessionStorage, and for private tabs also its
+    //    cookies and localStorage). Saved logins from regular tabs live on the device and stay.
+    fetch(`/api/session/clear?tabId=${encodeURIComponent(tabId)}`, { method: 'POST' }).catch(() => {});
+
+    if (tabToClose?.isPrivate) {
       // 2. Clear any local storage and session storage data associated with this private tab session
       try {
         sessionStorage.removeItem(`apex_session_${tabId}`);

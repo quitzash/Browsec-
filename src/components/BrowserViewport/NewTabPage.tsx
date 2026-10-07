@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Globe, Sparkles, BookOpen, Clock, ArrowUpRight, Compass, ShieldCheck } from 'lucide-react';
+import { Search, Globe, Sparkles, BookOpen, Clock, ArrowUpRight, Compass, KeyRound, ShieldCheck } from 'lucide-react';
 import { SPEED_DIAL_SITES, SEARCH_ENGINES } from '../../constants/presets';
 import { HistoryItem } from '../../types';
 
@@ -78,7 +78,7 @@ export const NewTabPage: React.FC<NewTabPageProps> = ({
               <div>
                 <span className="font-semibold text-purple-300 block mb-0.5">Session Cleanup:</span>
                 <p className="text-neutral-400">
-                  All local storage, cached session data, and isolated proxy cookies for this tab will be immediately erased upon closing this tab.
+                  All local storage, cached session data, and isolated session cookies for this tab will be immediately erased upon closing this tab.
                 </p>
               </div>
             </div>
@@ -208,11 +208,15 @@ export const NewTabPage: React.FC<NewTabPageProps> = ({
         <div className="w-full pt-6 border-t border-[#1e2028] flex flex-wrap items-center justify-between gap-4 text-xs text-neutral-500">
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span>Smart Proxy removes X-Frame-Options and CORS restrictions</span>
+            <span>VPN mode removes X-Frame-Options and CORS restrictions</span>
           </div>
           <div className="flex items-center gap-2">
             <BookOpen className="w-4 h-4 text-sky-400 shrink-0" />
             <span>Click the book icon in the Omnibox anytime for Distraction-Free Reader Mode</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <KeyRound className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>Logins and cookies are saved on this device only</span>
           </div>
         </div>
       </div>

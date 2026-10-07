@@ -223,7 +223,7 @@ export const Omnibox: React.FC<OmniboxProps> = ({
             )}
           </button>
 
-          {/* Security & Proxy Popover */}
+          {/* Security & VPN Popover */}
           {showSecurityPopover && (
             <div className="absolute top-8 left-0 z-50 w-76 p-3.5 bg-[#1c1e24] border border-[#2e313b] rounded-lg shadow-2xl text-xs space-y-2.5">
               <div className="flex items-center justify-between border-b border-neutral-800 pb-2">
@@ -265,13 +265,13 @@ export const Omnibox: React.FC<OmniboxProps> = ({
               ) : (
                 <p className="text-neutral-400 leading-relaxed text-[11px]">
                   {mode === 'proxy'
-                    ? 'Apex Smart Proxy is active. Stripping X-Frame-Options and CORS headers to enable seamless in-browser browsing.'
+                    ? 'Apex VPN is active. Pages are fetched by a VPN server, which also lifts frame-blocking headers so sites render inside the app.'
                     : 'Direct Sandbox Mode active. Browsing via standard frame container.'}
                 </p>
               )}
 
               <div className="pt-1 flex items-center justify-between border-t border-neutral-800">
-                <span className="text-neutral-400 text-[11px]">Rendering Mode</span>
+                <span className="text-neutral-400 text-[11px]">Connection</span>
                 <button
                   onClick={() => {
                     onToggleProxyMode();
@@ -279,7 +279,7 @@ export const Omnibox: React.FC<OmniboxProps> = ({
                   }}
                   className="px-2 py-1 text-[11px] rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-medium"
                 >
-                  Switch to {mode === 'proxy' ? 'Direct Mode' : 'Proxy Mode'}
+                  Switch to {mode === 'proxy' ? 'Direct Mode' : 'VPN Mode'}
                 </button>
               </div>
             </div>

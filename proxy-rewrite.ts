@@ -155,6 +155,135 @@ const SHIM_SOURCE = String.raw`
   var seg = encodeURIComponent(CTX.tabId || '-') + '.' + (CTX.isPrivate === 'true' ? 1 : 0);
   var SKIP = /^(data|blob|javascript|about|mailto|tel|sms):/i;
 
+  // ---- Saved on this device, namespaced per site -------------------------------------------
+  // Every site here runs on this app's single origin, so without this all of them (and the app
+  // itself) would share one localStorage bucket. Keep each site's data separate in memory, expose
+  // it through the normal Storage / document.cookie APIs, and write changes back to the server,
+  // which stores them on this device. These references are captured before fetch/sendBeacon get
+  // patched below, because the wrapper below would send /api/storage to the real site instead.
+  var rawFetch = window.fetch ? window.fetch.bind(window) : null;
+  var rawBeacon = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
+  var localData = CTX.local || {};
+  var sessionData = CTX.session || {};
+  var cookieEntries = {};
+  (CTX.docCookies || '').split(';').forEach(function (pair) {
+    pair = pair.trim();
+    if (!pair) return;
+    var eq = pair.indexOf('=');
+    if (eq > 0) cookieEntries[pair.slice(0, eq)] = pair;
+  });
+  var cookieWrites = [];
+  var storeTimer = null;
+
+  function postStore(unload) {
+    try {
+      var payload = {
+        token: CTX.token,
+        origin: CTX.page ? new URL(CTX.page).origin : '',
+        tabId: CTX.tabId || '',
+        isPrivate: CTX.isPrivate === 'true',
+        local: localData,
+        session: sessionData
+      };
+      if (cookieWrites.length) payload.cookies = cookieWrites.slice();
+      var text = JSON.stringify(payload);
+      var url = location.origin + '/api/storage';
+      if (unload) {
+        // This page lives in an iframe that is navigated away the instant it unloads, which can
+        // kill a request the page starts itself (ERR_ABORTED). Hand the data to the parent window
+        // instead: it outlives this frame and sends it with a keepalive fetch. The beacon stays as
+        // a fallback for when the parent is gone too; the endpoint is idempotent, so a double
+        // delivery is harmless.
+        var handedOff = false;
+        try {
+          window.parent.postMessage({ type: 'APEX_STORAGE_FLUSH', payload: payload }, '*');
+          handedOff = true;
+        } catch (e) {}
+        if (rawBeacon && text.length < 50000) {
+          rawBeacon(url, new Blob([text], { type: 'application/json' }));
+          cookieWrites = [];
+          return;
+        }
+        if (handedOff) { cookieWrites = []; return; }
+      }
+      if (rawFetch) {
+        rawFetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: text,
+          keepalive: !!unload,
+          credentials: 'same-origin'
+        }).then(function () { cookieWrites = []; }, function () {});
+      }
+    } catch (e) {}
+  }
+
+  function scheduleStore(immediate) {
+    if (storeTimer) clearTimeout(storeTimer);
+    if (immediate) { storeTimer = null; postStore(true); return; }
+    storeTimer = setTimeout(function () { storeTimer = null; postStore(false); }, 350);
+  }
+  // Last chance to flush before the document goes away.
+  window.addEventListener('pagehide', function () { scheduleStore(true); });
+
+  function makeStorage(data) {
+    var api = Object.create(window.Storage && Storage.prototype ? Storage.prototype : null);
+    api.getItem = function (k) { k = String(k); return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null; };
+    api.setItem = function (k, v) { data[String(k)] = String(v); scheduleStore(); };
+    api.removeItem = function (k) { delete data[String(k)]; scheduleStore(); };
+    api.clear = function () { Object.keys(data).forEach(function (k) { delete data[k]; }); scheduleStore(); };
+    api.key = function (i) { var ks = Object.keys(data); return i >= 0 && i < ks.length ? ks[i] : null; };
+    Object.defineProperty(api, 'length', { configurable: true, enumerable: false, get: function () { return Object.keys(data).length; } });
+    return api;
+  }
+  var localStore = makeStorage(localData);
+  var sessionStore = makeStorage(sessionData);
+  try {
+    Object.defineProperty(window, 'localStorage', { configurable: true, get: function () { return localStore; } });
+  } catch (e) {}
+  try {
+    Object.defineProperty(window, 'sessionStorage', { configurable: true, get: function () { return sessionStore; } });
+  } catch (e) {}
+
+  // document.cookie for this site's own cookies, minus HttpOnly ones (those stay server-side, as in
+  // a real browser). Assignments are forwarded to the jar with their attributes intact.
+  try {
+    var cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+    if (cookieDesc && cookieDesc.get && cookieDesc.set) {
+      Object.defineProperty(Document.prototype, 'cookie', {
+        configurable: true,
+        enumerable: cookieDesc.enumerable,
+        get: function () {
+          return Object.keys(cookieEntries).map(function (k) { return cookieEntries[k]; }).join('; ');
+        },
+        set: function (line) {
+          try {
+            line = String(line);
+            var first = line.split(';')[0];
+            var eq = first.indexOf('=');
+            if (eq <= 0) return;
+            var name = first.slice(0, eq).trim();
+            if (!name) return;
+            var dead = false;
+            var parts = line.split(';');
+            for (var i = 1; i < parts.length; i++) {
+              var attr = parts[i].trim().toLowerCase();
+              if (attr.indexOf('max-age=') === 0 && parseInt(attr.slice(8), 10) <= 0) dead = true;
+              else if (attr.indexOf('expires=') === 0) {
+                var when = Date.parse(parts[i].slice(parts[i].indexOf('=') + 1));
+                if (!isNaN(when) && when <= Date.now()) dead = true;
+              }
+            }
+            if (dead) delete cookieEntries[name];
+            else cookieEntries[name] = first.trim();
+            cookieWrites.push(line.trim());
+            scheduleStore();
+          } catch (e) {}
+        }
+      });
+    }
+  } catch (e) {}
+
   function wrap(u) {
     try {
       if (u == null) return u;
@@ -260,7 +389,28 @@ const SHIM_SOURCE = String.raw`
 })();
 `;
 
-export function buildClientShim(ctx: Pick<RewriteCtx, 'tabId' | 'isPrivate'>, realBase: string, pageUrl: string): string {
-  const payload = JSON.stringify({ tabId: ctx.tabId, isPrivate: ctx.isPrivate ? 'true' : 'false', base: realBase, page: pageUrl }).replace(/</g, '\\u003c');
+export interface PageState {
+  local?: Record<string, string>;
+  session?: Record<string, string>;
+  docCookies?: string;
+  token?: string;
+}
+
+export function buildClientShim(
+  ctx: Pick<RewriteCtx, 'tabId' | 'isPrivate'>,
+  realBase: string,
+  pageUrl: string,
+  pageState: PageState = {},
+): string {
+  const payload = JSON.stringify({
+    tabId: ctx.tabId,
+    isPrivate: ctx.isPrivate ? 'true' : 'false',
+    base: realBase,
+    page: pageUrl,
+    local: pageState.local || {},
+    session: pageState.session || {},
+    docCookies: pageState.docCookies || '',
+    token: pageState.token || '',
+  }).replace(/</g, '\\u003c');
   return `<script id="__apex_proxy_shim__">${SHIM_SOURCE.replace('__CTX__', payload)}</script>`;
 }

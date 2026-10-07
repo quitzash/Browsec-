@@ -3,6 +3,9 @@ import type { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { apiApp } from './server-api.ts';
+import { flushSavedLogins } from './cookie-store.ts';
+import { flushStorage } from './web-storage.ts';
+import { stopWarp } from './warp.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,8 +50,12 @@ async function setupServer() {
   });
 
   const shutdown = () => {
-    server.close(() => {
-      process.exit(0);
+    // Saved logins and site storage are debounced to disk; flush them so nothing typed in the last
+    // moment is lost, alongside stopping the tunnel.
+    Promise.allSettled([stopWarp(), flushSavedLogins(), flushStorage()]).finally(() => {
+      server.close(() => {
+        process.exit(0);
+      });
     });
   };
   process.on('SIGTERM', shutdown);

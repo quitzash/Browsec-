@@ -169,6 +169,20 @@ export const WebFrame: React.FC<WebFrameProps> = ({
           onNavigate('apex://newtab');
           break;
 
+        case 'APEX_STORAGE_FLUSH':
+          // A proxied page flushed the storage/cookies it saved as it unloaded. Its own request can
+          // die with the frame, so this window (which outlives it) sends the payload on; the server
+          // checks the signed token in it and files the data under the page's real site.
+          if (event.origin === window.location.origin && event.data.payload && typeof event.data.payload === 'object') {
+            fetch('/api/storage', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              keepalive: true,
+              body: JSON.stringify(event.data.payload),
+            }).catch(() => {});
+          }
+          break;
+
         case 'APEX_SWITCH_TO_DIRECT':
           if (onSwitchToDirect) {
             onSwitchToDirect();
@@ -233,10 +247,10 @@ export const WebFrame: React.FC<WebFrameProps> = ({
                 ? 'Connecting…'
                 : elapsedMs < 12000
                   ? upstreamActive
-                    ? 'Waiting for the site through your upstream proxy…'
+                    ? 'Waiting for the site through your VPN server…'
                     : 'Waiting for the site to respond…'
                   : upstreamActive
-                    ? 'Still waiting. This proxy looks slow: try another one in Settings, or switch to Direct mode.'
+                    ? 'Still waiting. This VPN server looks slow: try another in Settings, or switch to Direct mode.'
                     : 'Still waiting. The site is slow or blocking this connection.'}
             </p>
             <p className="mt-2 text-[11px] tabular-nums text-neutral-500">{(elapsedMs / 1000).toFixed(1)}s</p>
@@ -276,7 +290,7 @@ export const WebFrame: React.FC<WebFrameProps> = ({
             </div>
             <h3 className="text-lg font-semibold text-white mb-2">{targetLabel} can't be shown here</h3>
             <p className="text-sm text-neutral-400 max-w-md mb-6 leading-relaxed">
-              On your own connection, {frameCheck?.reason || 'this site refuses to be embedded'}. Open it in a new tab to use it with your real location, or go back to the server/proxy connection in Settings.
+              On your own connection, {frameCheck?.reason || 'this site refuses to be embedded'}. Open it in a new tab to use it with your real location, or switch back to the VPN in Settings.
             </p>
             <a
               href={url}
