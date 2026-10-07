@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import * as cheerio from 'cheerio';
 import dotenv from 'dotenv';
 import { ProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
+import { getRankedProxies } from './proxy-scanner.ts';
 
 dotenv.config();
 
@@ -182,7 +183,15 @@ export function createApiApp(): express.Express {
     return res.json({ success: true, message: `Session for tab ${tabId || 'unknown'} cleared.` });
   });
 
-  app.get('/api/network', (_req: Request, res: Response) => {
+  app.get('/api/network', async (req: Request, res: Response) => {
+    if (req.query.proxies === 'true') {
+      try {
+        const proxies = await getRankedProxies(req.query.refresh === 'true');
+        return res.json({ proxy: proxyStatus(), proxies });
+      } catch (err: any) {
+        return res.status(502).json({ proxy: proxyStatus(), error: err?.message || 'Proxy scan failed' });
+      }
+    }
     return res.json({ proxy: proxyStatus() });
   });
 

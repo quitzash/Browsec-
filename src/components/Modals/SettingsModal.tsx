@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { BrowserSettings } from '../../types';
 import { SEARCH_ENGINES, THEMES } from '../../constants/presets';
-import { Settings, X, Shield, Search, Globe, Bookmark, Palette, Network, Activity } from 'lucide-react';
+import { Settings, X, Shield, Search, Globe, Bookmark, Palette, Network, Activity, RefreshCw, Check } from 'lucide-react';
 
 interface UpstreamProxyStatus {
   enabled: boolean;
@@ -10,6 +10,22 @@ interface UpstreamProxyStatus {
   error: string | null;
   active: boolean;
   lastTest: { ok: boolean; latencyMs: number | null; error: string | null; checkedAt: number } | null;
+}
+
+interface RankedProxy {
+  url: string;
+  host: string;
+  latencyMs: number;
+  stability: number;
+  probes: number;
+}
+
+interface ProxyScan {
+  updatedAt: number;
+  durationMs: number;
+  tested: number;
+  alive: number;
+  items: RankedProxy[];
 }
 
 interface SettingsModalProps {
@@ -28,6 +44,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [proxy, setProxy] = useState<UpstreamProxyStatus | null>(null);
   const [proxyUrl, setProxyUrl] = useState('');
   const [busy, setBusy] = useState(false);
+  const [scan, setScan] = useState<ProxyScan | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -65,6 +84,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setBusy(false);
     }
   }, []);
+
+  const scanProxies = useCallback(async (refresh: boolean) => {
+    setScanning(true);
+    setScanError(null);
+    try {
+      const res = await fetch(`/api/network?proxies=true${refresh ? '&refresh=true' : ''}`);
+      const data = await res.json();
+      if (!res.ok || !data.proxies) throw new Error(data.error || 'Scan failed');
+      setScan(data.proxies);
+    } catch (err: any) {
+      setScanError(err?.message || 'Scan failed');
+    } finally {
+      setScanning(false);
+    }
+  }, []);
+
+  const selectProxy = useCallback(
+    (url: string) => saveProxy({ url, enabled: true, test: true }),
+    [saveProxy],
+  );
 
   if (!isOpen) return null;
 
@@ -210,6 +249,64 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               >
                 Save
               </button>
+            </div>
+            <div className="space-y-1.5 pt-1">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-medium text-neutral-300">Fastest public proxies</span>
+                <button
+                  onClick={() => scanProxies(!!scan)}
+                  disabled={scanning || busy}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-[#272933] bg-[#191b22] text-neutral-200 hover:bg-[#20222b] text-[11px] font-medium disabled:opacity-50 transition-colors shrink-0"
+                >
+                  <RefreshCw className={`w-3 h-3 ${scanning ? 'animate-spin' : ''}`} />
+                  {scanning ? 'Scanning…' : scan ? 'Rescan' : 'Find fastest'}
+                </button>
+              </div>
+              {scanning && (
+                <p className="text-[11px] text-neutral-500">
+                  Testing hundreds of free proxies for speed and stability. This takes about 20 seconds.
+                </p>
+              )}
+              {scanError && <p className="text-[11px] text-red-400">{scanError}</p>}
+              {scan && !scanning && (
+                <>
+                  {scan.items.length === 0 ? (
+                    <p className="text-[11px] text-neutral-500">No stable proxies found right now. Try rescanning.</p>
+                  ) : (
+                    <ul className="space-y-1">
+                      {scan.items.map((item, index) => {
+                        const selected = !!proxy?.enabled && proxy.url.replace(/\/$/, '') === item.url;
+                        return (
+                          <li key={item.url}>
+                            <button
+                              onClick={() => selectProxy(item.url)}
+                              disabled={busy}
+                              className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg border text-left transition-colors disabled:opacity-50 ${
+                                selected
+                                  ? 'bg-emerald-500/10 border-emerald-500/40 text-white'
+                                  : 'bg-[#191b22] border-[#272933] text-neutral-300 hover:bg-[#20222b]'
+                              }`}
+                            >
+                              <span className="w-4 text-[10px] text-neutral-500">{index + 1}</span>
+                              <span className="flex-1 min-w-0 truncate font-mono text-[11px]">{item.host}</span>
+                              <span className="text-[10px] text-neutral-400 tabular-nums">{item.latencyMs}ms</span>
+                              <span
+                                className={`text-[10px] tabular-nums ${item.stability >= 1 ? 'text-emerald-400' : 'text-amber-400'}`}
+                              >
+                                {Math.round(item.stability * 100)}%
+                              </span>
+                              {selected && <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                  <p className="text-[10px] text-neutral-500 leading-relaxed">
+                    Checked {scan.tested} proxies, {scan.alive} responded. Percent shows how many repeat checks succeeded over HTTPS. Free proxies are run by strangers and can see which sites you connect to, so avoid them for sensitive traffic.
+                  </p>
+                </>
+              )}
             </div>
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-neutral-400">
