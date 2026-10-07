@@ -201,6 +201,8 @@ export function createApiApp(): express.Express {
     const rawUrl = body.url ?? query.url;
     const rawEnabled = body.enabled ?? query.enabled;
     const rawTest = body.test ?? query.test;
+    const rawRevert = body.revertOnFail ?? query.revertOnFail;
+    const previous = { url: upstream.url, enabled: upstream.enabled, source: upstream.source };
 
     if (typeof rawUrl === 'string') {
       const next = rawUrl.trim();
@@ -236,6 +238,16 @@ export function createApiApp(): express.Express {
 
     if (rawTest === true || rawTest === 'true') {
       upstream.lastTest = await runProxyTest();
+      // Picking a proxy from the list must not leave the app on one that just stopped responding.
+      if (!upstream.lastTest.ok && (rawRevert === true || rawRevert === 'true')) {
+        const failed = upstream.lastTest;
+        upstream.url = previous.url;
+        upstream.enabled = previous.enabled;
+        upstream.source = previous.source;
+        applyUpstreamProxy();
+        upstream.lastTest = failed;
+        return res.json({ proxy: proxyStatus(), reverted: true });
+      }
     }
 
     return res.json({ proxy: proxyStatus() });

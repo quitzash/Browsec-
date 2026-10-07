@@ -1,11 +1,14 @@
 import { Agent, ProxyAgent, fetch as undiciFetch } from 'undici';
 
+export type SearchEngineId = 'duckduckgo' | 'bing' | 'wikipedia';
+
 export interface ScannedProxy {
   url: string;
   host: string;
   latencyMs: number;
   stability: number;
   probes: number;
+  engines: SearchEngineId[];
 }
 
 export interface ProxyScanResult {
@@ -22,20 +25,34 @@ const SOURCES = [
   'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
 ];
 
+interface Target {
+  url: string;
+  marker: string;
+}
+
 // Every probe goes over HTTPS (certificates are verified) and the body must contain a marker,
-// so a proxy that rewrites or injects content is rejected.
-const TARGETS = [
+// so a proxy that rewrites, blocks or injects content is rejected.
+const GENERIC_TARGETS: Target[] = [
   { url: 'https://example.com/', marker: 'Example Domain' },
   { url: 'https://www.cloudflare.com/cdn-cgi/trace', marker: 'colo=' },
 ];
 
-const MAX_CANDIDATES = 400;
-const STAGE1_CONCURRENCY = 150;
+// Many free proxies load ordinary sites but are blocked by search engines, so search is tested separately.
+const ENGINE_TARGETS: Record<SearchEngineId, Target> = {
+  duckduckgo: { url: 'https://html.duckduckgo.com/html/?q=cats', marker: 'result__a' },
+  bing: { url: 'https://www.bing.com/search?q=cats', marker: 'b_results' },
+  wikipedia: { url: 'https://en.wikipedia.org/wiki/Special:Search?search=cats', marker: 'Wikipedia' },
+};
+const ENGINE_IDS = Object.keys(ENGINE_TARGETS) as SearchEngineId[];
+
+const MAX_CANDIDATES = 700;
+const STAGE1_CONCURRENCY = 200;
 const STAGE1_TIMEOUT_MS = 4000;
-const STAGE2_POOL = 24;
-const STAGE2_ROUNDS = 4;
-const STAGE2_TIMEOUT_MS = 6000;
+const STAGE2_POOL = 60;
+const STAGE2_CONCURRENCY = 200;
+const STAGE2_TIMEOUT_MS = 7000;
 const MIN_STABILITY = 0.75;
+const RECHECK_POOL = 20;
 const MAX_RESULTS = 12;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
@@ -87,14 +104,17 @@ async function loadCandidates(): Promise<string[]> {
   return all.slice(0, MAX_CANDIDATES);
 }
 
-async function probe(proxyUrl: string, target: (typeof TARGETS)[number], timeoutMs: number): Promise<number | null> {
+async function probe(proxyUrl: string, target: Target, timeoutMs: number): Promise<number | null> {
   const agent = new ProxyAgent({ uri: proxyUrl, connectTimeout: timeoutMs });
   const started = Date.now();
   try {
     const res = await undiciFetch(target.url, {
       dispatcher: agent,
       signal: AbortSignal.timeout(timeoutMs),
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ApexProxyCheck/1.0)' },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
     });
     if (!res.ok) return null;
     const body = await res.text();
@@ -131,35 +151,69 @@ async function scan(): Promise<ProxyScanResult> {
   // Stage 1: cheap single probe to discard dead proxies.
   const firstPass = await runPool(candidates, STAGE1_CONCURRENCY, async (url) => ({
     url,
-    latency: await probe(url, TARGETS[0], STAGE1_TIMEOUT_MS),
+    latency: await probe(url, GENERIC_TARGETS[0], STAGE1_TIMEOUT_MS),
   }));
   const survivors = firstPass
     .filter((r): r is { url: string; latency: number } => r.latency !== null)
     .sort((a, b) => a.latency - b.latency)
     .slice(0, STAGE2_POOL);
 
-  // Stage 2: repeated probes against different hosts to measure stability and typical latency.
-  const scored = await Promise.all(
-    survivors.map(async ({ url, latency }) => {
-      const rounds = await Promise.all(
-        Array.from({ length: STAGE2_ROUNDS }, (_, i) => probe(url, TARGETS[i % TARGETS.length], STAGE2_TIMEOUT_MS)),
-      );
-      const okLatencies = [latency, ...rounds.filter((r): r is number => r !== null)];
-      const total = rounds.length + 1;
-      const proxy: ScannedProxy = {
-        url,
-        host: url.replace(/^https?:\/\//, ''),
-        latencyMs: median(okLatencies),
-        stability: okLatencies.length / total,
-        probes: total,
-      };
-      return proxy;
-    }),
-  );
+  // Stage 2: repeated generic probes measure stability; search-engine probes decide what the proxy is usable for.
+  type Job = { url: string; kind: 'generic' | 'engine'; engine?: SearchEngineId; target: Target };
+  const jobs: Job[] = [];
+  for (const { url } of survivors) {
+    for (const target of [GENERIC_TARGETS[1], GENERIC_TARGETS[0], GENERIC_TARGETS[1]]) {
+      jobs.push({ url, kind: 'generic', target });
+    }
+    for (const engine of ENGINE_IDS) jobs.push({ url, kind: 'engine', engine, target: ENGINE_TARGETS[engine] });
+  }
+  const outcomes = await runPool(jobs, STAGE2_CONCURRENCY, async (job) => ({
+    job,
+    latency: await probe(job.url, job.target, STAGE2_TIMEOUT_MS),
+  }));
 
-  const items = scored
-    .filter((p) => p.stability >= MIN_STABILITY)
-    .sort((a, b) => b.stability - a.stability || a.latencyMs - b.latencyMs)
+  const scored: ScannedProxy[] = survivors.map(({ url, latency }) => {
+    const mine = outcomes.filter((o) => o.job.url === url);
+    const generic = mine.filter((o) => o.job.kind === 'generic');
+    const engineHits = mine.filter((o) => o.job.kind === 'engine' && o.latency !== null);
+    const genericOk = generic.filter((o) => o.latency !== null).length + 1;
+    const latencies = [
+      latency,
+      ...generic.filter((o) => o.latency !== null).map((o) => o.latency as number),
+      ...engineHits.map((o) => o.latency as number),
+    ];
+    return {
+      url,
+      host: url.replace(/^https?:\/\//, ''),
+      latencyMs: median(latencies),
+      stability: genericOk / (generic.length + 1),
+      probes: generic.length + 1 + ENGINE_IDS.length,
+      engines: engineHits.map((o) => o.job.engine as SearchEngineId),
+    };
+  });
+
+  const shortlist = scored
+    .filter((p) => p.stability >= MIN_STABILITY && p.engines.length > 0)
+    .sort((a, b) => b.engines.length - a.engines.length || b.stability - a.stability || a.latencyMs - b.latencyMs)
+    .slice(0, RECHECK_POOL);
+
+  // Final recheck: free proxies die within minutes, so confirm each finalist's claimed engines once more.
+  const rechecks = await runPool(
+    shortlist.flatMap((p) => p.engines.map((engine) => ({ p, engine }))),
+    STAGE2_CONCURRENCY,
+    async ({ p, engine }) => ({ p, engine, latency: await probe(p.url, ENGINE_TARGETS[engine], STAGE2_TIMEOUT_MS) }),
+  );
+  const items = shortlist
+    .map((p) => {
+      const passed = rechecks.filter((r) => r.p === p && r.latency !== null);
+      return {
+        ...p,
+        engines: passed.map((r) => r.engine),
+        latencyMs: passed.length ? median([...passed.map((r) => r.latency as number), p.latencyMs]) : p.latencyMs,
+      };
+    })
+    .filter((p) => p.engines.length > 0)
+    .sort((a, b) => b.engines.length - a.engines.length || b.stability - a.stability || a.latencyMs - b.latencyMs)
     .slice(0, MAX_RESULTS);
 
   return {

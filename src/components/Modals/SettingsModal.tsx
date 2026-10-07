@@ -18,7 +18,10 @@ interface RankedProxy {
   latencyMs: number;
   stability: number;
   probes: number;
+  engines: string[];
 }
+
+const ENGINE_LABELS: Record<string, string> = { duckduckgo: 'DDG', bing: 'Bing', wikipedia: 'Wiki' };
 
 interface ProxyScan {
   updatedAt: number;
@@ -47,6 +50,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [scan, setScan] = useState<ProxyScan | null>(null);
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -65,19 +69,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     };
   }, [isOpen]);
 
-  const saveProxy = useCallback(async (payload: { enabled?: boolean; url?: string; test?: boolean }) => {
+  const saveProxy = useCallback(async (payload: { enabled?: boolean; url?: string; test?: boolean; revertOnFail?: boolean }) => {
     setBusy(true);
     try {
       const params = new URLSearchParams();
       if (typeof payload.enabled === 'boolean') params.set('enabled', String(payload.enabled));
       if (typeof payload.url === 'string') params.set('url', payload.url);
       if (payload.test) params.set('test', 'true');
+      if (payload.revertOnFail) params.set('revertOnFail', 'true');
       const res = await fetch(`/api/network?${params.toString()}`, { method: 'POST' });
       const data = await res.json();
       if (data.proxy) {
         setProxy(data.proxy);
         setProxyUrl(data.proxy.url);
       }
+      setNotice(
+        data.reverted
+          ? 'That proxy stopped responding, so your previous setting was kept. Pick another or rescan.'
+          : null,
+      );
     } catch {
       // network failure keeps the previous status on screen
     } finally {
@@ -101,11 +111,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, []);
 
   const selectProxy = useCallback(
-    (url: string) => saveProxy({ url, enabled: true, test: true }),
+    (url: string) => saveProxy({ url, enabled: true, test: true, revertOnFail: true }),
     [saveProxy],
   );
 
   if (!isOpen) return null;
+
+  // Search engines that ride on DuckDuckGo's HTML endpoint need a proxy DuckDuckGo doesn't block.
+  const preferredEngine =
+    settings.defaultSearchEngine === 'google' ? 'duckduckgo' : settings.defaultSearchEngine;
+  const rankedItems = scan
+    ? [...scan.items].sort(
+        (a, b) =>
+          Number(b.engines.includes(preferredEngine)) - Number(a.engines.includes(preferredEngine)),
+      )
+    : [];
 
   const statusBadge = !proxy ? (
     <span className="text-[10px] font-medium text-neutral-500">loading…</span>
@@ -264,17 +284,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
               {scanning && (
                 <p className="text-[11px] text-neutral-500">
-                  Testing hundreds of free proxies for speed and stability. This takes about 20 seconds.
+                  Testing hundreds of free proxies for speed and stability. Only proxies that can actually load search results are listed. This takes about 30 seconds.
                 </p>
               )}
               {scanError && <p className="text-[11px] text-red-400">{scanError}</p>}
+              {notice && <p className="text-[11px] text-amber-400">{notice}</p>}
               {scan && !scanning && (
                 <>
-                  {scan.items.length === 0 ? (
-                    <p className="text-[11px] text-neutral-500">No stable proxies found right now. Try rescanning.</p>
+                  {rankedItems.length === 0 ? (
+                    <p className="text-[11px] text-neutral-500">No proxies that can load search engines right now. Try rescanning.</p>
                   ) : (
                     <ul className="space-y-1">
-                      {scan.items.map((item, index) => {
+                      {rankedItems.map((item, index) => {
                         const selected = !!proxy?.enabled && proxy.url.replace(/\/$/, '') === item.url;
                         return (
                           <li key={item.url}>
@@ -289,6 +310,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             >
                               <span className="w-4 text-[10px] text-neutral-500">{index + 1}</span>
                               <span className="flex-1 min-w-0 truncate font-mono text-[11px]">{item.host}</span>
+                              <span className="flex gap-1">
+                                {Object.keys(ENGINE_LABELS).map((id) => (
+                                  <span
+                                    key={id}
+                                    className={`px-1 rounded text-[9px] font-medium ${
+                                      item.engines.includes(id)
+                                        ? id === preferredEngine
+                                          ? 'bg-emerald-500/20 text-emerald-300'
+                                          : 'bg-sky-500/15 text-sky-300'
+                                        : 'bg-neutral-800/60 text-neutral-600 line-through'
+                                    }`}
+                                  >
+                                    {ENGINE_LABELS[id]}
+                                  </span>
+                                ))}
+                              </span>
                               <span className="text-[10px] text-neutral-400 tabular-nums">{item.latencyMs}ms</span>
                               <span
                                 className={`text-[10px] tabular-nums ${item.stability >= 1 ? 'text-emerald-400' : 'text-amber-400'}`}
@@ -303,7 +340,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </ul>
                   )}
                   <p className="text-[10px] text-neutral-500 leading-relaxed">
-                    Checked {scan.tested} proxies, {scan.alive} responded. Percent shows how many repeat checks succeeded over HTTPS. Free proxies are run by strangers and can see which sites you connect to, so avoid them for sensitive traffic.
+                    Checked {scan.tested} proxies, {scan.alive} responded. Badges show which search engines each proxy can load (the highlighted badge is your default engine). Percent shows how many repeat checks succeeded over HTTPS. Free proxies are run by strangers and can see which sites you connect to, so avoid them for sensitive traffic.
                   </p>
                 </>
               )}
