@@ -3,11 +3,15 @@ import type { Request, Response } from 'express';
 import * as cheerio from 'cheerio';
 import dotenv from 'dotenv';
 import { ProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
+import net from 'net';
 import { Readable } from 'stream';
 import { getRankedProxies } from './proxy-scanner.ts';
 import { buildClientShim, rewriteCss, rewriteHtmlResources, rewriteJsImports } from './proxy-rewrite.ts';
 
 dotenv.config();
+
+// Node races IPv6/IPv4 connection attempts with a 250ms budget each; cold DNS or a slow route makes that fail spuriously.
+net.setDefaultAutoSelectFamilyAttemptTimeout?.(2000);
 
 const defaultDispatcher = getGlobalDispatcher();
 
@@ -141,6 +145,16 @@ function sanitizeAndValidateUrl(inputUrl: string): { valid: boolean; url?: strin
   } catch {
     return { valid: false, error: 'Invalid URL format' };
   }
+}
+
+/** The origin the browser used to reach this server, so rewritten URLs can be absolute. */
+function publicOrigin(req: Request): string {
+  const first = (value: unknown) => String(Array.isArray(value) ? value[0] : value || '').split(',')[0].trim();
+  const proto = first(req.headers['x-forwarded-proto']) || req.protocol || 'http';
+  const host = first(req.headers['x-forwarded-host']) || req.get('host') || 'localhost';
+  // Both end up inside HTML/CSS/JS text, so refuse anything that isn't a plain scheme and host[:port].
+  if (!/^https?$/.test(proto) || !/^[a-z0-9.\-:\[\]]+$/i.test(host)) return 'http://localhost:3000';
+  return `${proto}://${host}`;
 }
 
 function jarCookieName(tabId: string): string {
@@ -436,8 +450,24 @@ export function createApiApp(): express.Express {
     }
   });
 
-  app.all('/api/proxy', async (req: Request, res: Response) => {
-    const urlParam = req.query.url as string;
+  app.all(['/api/proxy', '/api/proxy/*'], async (req: Request, res: Response) => {
+    // Two address forms: ?url=<target> (top-level navigation) and /api/proxy/<tab>.<private>/<scheme>/<host>/<path> (subresources).
+    let urlParam = req.query.url as string;
+    let pathTab = '';
+    let pathPrivate = false;
+    if (req.path.startsWith('/api/proxy/')) {
+      const raw = req.originalUrl;
+      const q = raw.indexOf('?');
+      const rest = (q < 0 ? raw : raw.slice(0, q)).slice('/api/proxy/'.length).split('/');
+      const [ctxSeg = '', scheme = '', host = '', ...tail] = rest;
+      const dot = ctxSeg.lastIndexOf('.');
+      try {
+        const tab = decodeURIComponent(dot < 0 ? ctxSeg : ctxSeg.slice(0, dot));
+        pathTab = tab === '-' ? '' : tab;
+      } catch {}
+      pathPrivate = ctxSeg.endsWith('.1');
+      urlParam = /^https?$/.test(scheme) && host ? `${scheme}://${host}/${tail.join('/')}${q < 0 ? '' : raw.slice(q)}` : '';
+    }
     const validation = sanitizeAndValidateUrl(urlParam);
 
     if (!validation.valid || !validation.url) {
@@ -463,9 +493,9 @@ export function createApiApp(): express.Express {
     }
 
     let targetUrl = validation.url;
-    const tabId = (req.query.tabId as string) || '';
-    const isPrivate = req.query.isPrivate === 'true';
-    const rewriteCtx = { tabId, isPrivate };
+    const tabId = pathTab || (req.query.tabId as string) || '';
+    const isPrivate = pathPrivate || req.query.isPrivate === 'true';
+    const rewriteCtx = { tabId, isPrivate, origin: publicOrigin(req) };
     // Browsers label every request with what it is for; only real documents get interstitials and the injected bridge.
     const dest = String(req.headers['sec-fetch-dest'] || 'document').toLowerCase();
     const isDocument = ['document', 'iframe', 'frame', 'embed', 'object'].includes(dest);
@@ -547,7 +577,16 @@ export function createApiApp(): express.Express {
         signal: controller.signal,
       };
 
-      const response = await fetch(targetUrl, fetchOptions).finally(() => clearTimeout(headerTimer));
+      // Free proxies and busy hosts drop connections now and then; an idempotent request is safe to retry once.
+      let response: Awaited<ReturnType<typeof fetch>>;
+      try {
+        response = await fetch(targetUrl, fetchOptions);
+      } catch (firstError: any) {
+        if ((method !== 'GET' && method !== 'HEAD') || controller.signal.aborted) throw firstError;
+        response = await fetch(targetUrl, fetchOptions);
+      } finally {
+        clearTimeout(headerTimer);
+      }
       const finalUrl = response.url;
       const contentType = response.headers.get('content-type') || '';
 
@@ -874,8 +913,12 @@ export function createApiApp(): express.Express {
       }
 
       // Subresources, API calls and non-HTML documents.
-      if (!isDocument && response.ok) {
-        res.setHeader('Cache-Control', 'public, max-age=600');
+      // Only cache static assets, and only in the browser's own cache: API responses and pages can be personal,
+      // and a shared cache in front of this server must never hand them to someone else.
+      if (!isDocument && response.ok && ['style', 'script', 'image', 'font', 'video', 'audio'].includes(dest)) {
+        res.setHeader('Cache-Control', 'private, max-age=600');
+      } else {
+        res.setHeader('Cache-Control', 'no-store');
       }
 
       if (/text\/css/i.test(contentType)) {
@@ -905,6 +948,7 @@ export function createApiApp(): express.Express {
       stream.on('error', () => res.destroy());
       return stream.pipe(res);
     } catch (err: any) {
+      console.warn(`[proxy] ${req.method} ${targetUrl} failed: ${err?.message}${err?.cause ? ` (${err.cause.code || err.cause.message})` : ''}`);
       if (!isDocument) {
         return res.status(502).type('text/plain').send(`Proxy fetch failed: ${err?.message || 'unknown error'}`);
       }

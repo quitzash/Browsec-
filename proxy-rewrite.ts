@@ -3,20 +3,32 @@ import type { CheerioAPI } from 'cheerio';
 export interface RewriteCtx {
   tabId: string;
   isPrivate: boolean;
+  /** Public origin of this app, e.g. https://host:3000. Rewritten URLs must be absolute, otherwise <base> sends them to the target site. */
+  origin: string;
 }
 
 const NON_HTTP = /^(data|blob|javascript|about|mailto|tel|sms|chrome|file):/i;
 
+// encodeURIComponent leaves ! ' ( ) * alone, which would terminate an unquoted CSS url(...) early.
+function encodeParam(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+
+/**
+ * Path-style proxy URL: /api/proxy/<tab>.<private>/<scheme>/<host>/<path>?<query>
+ * Keeping the target's own path structure means relative URLs, `import.meta.url` and bundlers that
+ * build chunk URLs by string concatenation keep resolving inside the proxy.
+ */
 export function proxyPath(abs: string, ctx: RewriteCtx): string {
-  let out = `/api/proxy?url=${encodeURIComponent(abs)}`;
-  if (ctx.tabId) out += `&tabId=${encodeURIComponent(ctx.tabId)}&isPrivate=${ctx.isPrivate ? 'true' : 'false'}`;
-  return out;
+  const u = new URL(abs);
+  const tab = encodeParam(ctx.tabId || '-');
+  return `${ctx.origin}/api/proxy/${tab}.${ctx.isPrivate ? 1 : 0}/${u.protocol.slice(0, -1)}/${u.host}${u.pathname}${u.search}`;
 }
 
 /** Resolve `value` against `base` and point it at the proxy. Leaves non-http(s) values untouched. */
 export function toProxied(value: string, base: string, ctx: RewriteCtx): string {
   const v = value.trim();
-  if (!v || v.startsWith('#') || NON_HTTP.test(v) || v.startsWith('/api/proxy?')) return value;
+  if (!v || v.startsWith('#') || NON_HTTP.test(v) || v.startsWith('/api/proxy') || v.startsWith(`${ctx.origin}/api/proxy`)) return value;
   try {
     const url = new URL(v, base);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return value;
@@ -120,18 +132,18 @@ export function rewriteHtmlResources($: CheerioAPI, base: string, ctx: RewriteCt
 const SHIM_SOURCE = String.raw`
 (function () {
   var CTX = __CTX__;
-  var tail = CTX.tabId ? '&tabId=' + encodeURIComponent(CTX.tabId) + '&isPrivate=' + CTX.isPrivate : '';
+  var seg = encodeURIComponent(CTX.tabId || '-') + '.' + (CTX.isPrivate === 'true' ? 1 : 0);
   var SKIP = /^(data|blob|javascript|about|mailto|tel|sms):/i;
 
   function wrap(u) {
     try {
       if (u == null) return u;
       var s = String(u);
-      if (!s || s.charAt(0) === '#' || SKIP.test(s) || s.indexOf('/api/proxy?') === 0) return u;
+      if (!s || s.charAt(0) === '#' || SKIP.test(s)) return u;
       var abs = new URL(s, document.baseURI);
       if (abs.protocol !== 'http:' && abs.protocol !== 'https:') return u;
       if (abs.origin === location.origin && abs.pathname.indexOf('/api/proxy') === 0) return u;
-      return '/api/proxy?url=' + encodeURIComponent(abs.href) + tail;
+      return location.origin + '/api/proxy/' + seg + '/' + abs.protocol.slice(0, -1) + '/' + abs.host + abs.pathname + abs.search;
     } catch (e) { return u; }
   }
 
@@ -209,7 +221,7 @@ const SHIM_SOURCE = String.raw`
 })();
 `;
 
-export function buildClientShim(ctx: RewriteCtx): string {
+export function buildClientShim(ctx: Pick<RewriteCtx, 'tabId' | 'isPrivate'>): string {
   const payload = JSON.stringify({ tabId: ctx.tabId, isPrivate: ctx.isPrivate ? 'true' : 'false' }).replace(/</g, '\\u003c');
   return `<script id="__apex_proxy_shim__">${SHIM_SOURCE.replace('__CTX__', payload)}</script>`;
 }
