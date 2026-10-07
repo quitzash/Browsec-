@@ -118,7 +118,19 @@ export function rewriteHtmlResources($: CheerioAPI, base: string, ctx: RewriteCt
 
   $('form').each((_, el) => {
     const method = ($(el).attr('method') || 'get').toLowerCase();
-    if (method === 'post') $(el).attr('action', toProxied($(el).attr('action') || base, base, ctx));
+    if (method !== 'post') return;
+    const action = $(el).attr('action') || base;
+    let host = '';
+    try {
+      host = new URL(action, base).hostname;
+    } catch {}
+    // DuckDuckGo answers POSTed searches from server IPs with a bot challenge, but the same query as a GET works.
+    // GET forms are handled by the page bridge, which needs the real (unproxied) action.
+    if (host === 'duckduckgo.com' || host.endsWith('.duckduckgo.com')) {
+      $(el).attr('method', 'get');
+      return;
+    }
+    $(el).attr('action', toProxied(action, base, ctx));
   });
 
   // Integrity hashes and CORS modes break once the bytes come from a different origin and path.
@@ -143,6 +155,8 @@ const SHIM_SOURCE = String.raw`
       var abs = new URL(s, document.baseURI);
       if (abs.protocol !== 'http:' && abs.protocol !== 'https:') return u;
       if (abs.origin === location.origin && abs.pathname.indexOf('/api/proxy') === 0) return u;
+      // Pages build URLs from location.origin, which here is this app. They mean their own site.
+      if (abs.origin === location.origin) { try { abs = new URL(abs.pathname + abs.search, CTX.base); } catch (e) {} }
       return location.origin + '/api/proxy/' + seg + '/' + abs.protocol.slice(0, -1) + '/' + abs.host + abs.pathname + abs.search;
     } catch (e) { return u; }
   }
@@ -221,7 +235,7 @@ const SHIM_SOURCE = String.raw`
 })();
 `;
 
-export function buildClientShim(ctx: Pick<RewriteCtx, 'tabId' | 'isPrivate'>): string {
-  const payload = JSON.stringify({ tabId: ctx.tabId, isPrivate: ctx.isPrivate ? 'true' : 'false' }).replace(/</g, '\\u003c');
+export function buildClientShim(ctx: Pick<RewriteCtx, 'tabId' | 'isPrivate'>, realBase: string): string {
+  const payload = JSON.stringify({ tabId: ctx.tabId, isPrivate: ctx.isPrivate ? 'true' : 'false', base: realBase }).replace(/</g, '\\u003c');
   return `<script id="__apex_proxy_shim__">${SHIM_SOURCE.replace('__CTX__', payload)}</script>`;
 }

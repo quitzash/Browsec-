@@ -27,3 +27,8 @@
     background: rgba(160, 160, 160, 0.35);
   }
 }
+
+@keyframes apex-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}

@@ -5,7 +5,9 @@ import dotenv from 'dotenv';
 import { ProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import net from 'net';
 import { Readable } from 'stream';
+import { createHash } from 'crypto';
 import { getRankedProxies } from './proxy-scanner.ts';
+import { AssetCache, Semaphore, pageUrlFromReferer, sendText, type CachedAsset } from './proxy-perf.ts';
 import { buildClientShim, rewriteCss, rewriteHtmlResources, rewriteJsImports } from './proxy-rewrite.ts';
 
 dotenv.config();
@@ -14,6 +16,10 @@ dotenv.config();
 net.setDefaultAutoSelectFamilyAttemptTimeout?.(2000);
 
 const defaultDispatcher = getGlobalDispatcher();
+
+// Free proxies drop connections when a page fires dozens of parallel requests, so queue them instead.
+const upstreamGate = new Semaphore(Math.max(1, Number(process.env.UPSTREAM_MAX_CONCURRENCY) || 8));
+const assetCache = new AssetCache();
 
 type ProxyTestResult = { ok: boolean; latencyMs: number | null; error: string | null; checkedAt: number };
 
@@ -522,6 +528,7 @@ export function createApiApp(): express.Express {
     try {
       const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
       const targetOrigin = new URL(targetUrl).origin;
+      const pageUrl = pageUrlFromReferer(req.headers.referer);
       const forwardHeaders: Record<string, string> = isDocument
         ? {
             'User-Agent': UA,
@@ -540,8 +547,12 @@ export function createApiApp(): express.Express {
             'User-Agent': UA,
             'Accept': String(req.headers.accept || '*/*'),
             'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': `${targetOrigin}/`,
+            // Hotlink protection and CORS checks look at the page that asked, not at the asset's own host.
+            'Referer': pageUrl || `${targetOrigin}/`,
           };
+      if (!isDocument && pageUrl && (dest === 'empty' || dest === 'font')) {
+        forwardHeaders['Origin'] = new URL(pageUrl).origin;
+      }
 
       if (!isDocument && req.headers.range) {
         forwardHeaders['Range'] = String(req.headers.range);
@@ -555,12 +566,49 @@ export function createApiApp(): express.Express {
       if (method !== 'GET' && method !== 'HEAD') {
         const contentTypeIn = String(req.headers['content-type'] || '');
         if (contentTypeIn) forwardHeaders['Content-Type'] = contentTypeIn;
-        forwardHeaders['Origin'] = targetOrigin;
+        forwardHeaders['Origin'] = pageUrl ? new URL(pageUrl).origin : targetOrigin;
         body = (req as any).rawBody as Buffer | undefined;
         if (!body) {
           const chunks: Buffer[] = [];
           for await (const chunk of req) chunks.push(Buffer.from(chunk));
           body = Buffer.concat(chunks);
+        }
+      }
+
+      // Static assets: serve repeats from memory instead of going back through a slow upstream proxy.
+      const cacheable = !isDocument && method === 'GET' && !req.headers.range && ['style', 'script', 'image', 'font'].includes(dest);
+      const cacheKey = cacheable
+        ? `${targetUrl}|${existingJar ? createHash('sha1').update(existingJar).digest('hex') : ''}`
+        : '';
+
+      const emitAsset = async (asset: CachedAsset, state: 'hit' | 'miss') => {
+        res.setHeader('Cache-Control', 'private, max-age=600');
+        res.setHeader('X-Proxy-Cache', state);
+        if (/text\/css/i.test(asset.contentType)) {
+          const css = rewriteCss(asset.body.toString('utf8'), asset.finalUrl, rewriteCtx);
+          return sendText(req, res, asset.status, 'text/css; charset=utf-8', css);
+        }
+        if (/javascript|ecmascript/i.test(asset.contentType)) {
+          const js = rewriteJsImports(asset.body.toString('utf8'), asset.finalUrl, rewriteCtx);
+          return sendText(req, res, asset.status, 'application/javascript; charset=utf-8', js);
+        }
+        res.status(asset.status);
+        res.setHeader('Content-Type', asset.contentType || 'application/octet-stream');
+        for (const [name, value] of Object.entries(asset.headers)) res.setHeader(name, value);
+        res.setHeader('Content-Length', asset.body.length);
+        res.end(asset.body);
+      };
+
+      const hit = cacheKey ? assetCache.get(cacheKey) : undefined;
+      if (hit) return await emitAsset(hit, 'hit');
+
+      // Queue behind the concurrency cap when an upstream proxy is carrying traffic. Media streams are exempt: they are few and long-lived.
+      if (upstream.enabled && !upstream.error && dest !== 'video' && dest !== 'audio') {
+        const release = await upstreamGate.acquire();
+        res.on('close', release);
+        if (res.destroyed) {
+          release();
+          return;
         }
       }
 
@@ -589,6 +637,18 @@ export function createApiApp(): express.Express {
       }
       const finalUrl = response.url;
       const contentType = response.headers.get('content-type') || '';
+
+      if (cacheKey && response.status === 200 && Number(response.headers.get('content-length') || 0) <= assetCache.maxItemBytes) {
+        const body = Buffer.from(await response.arrayBuffer());
+        const extra: Record<string, string> = {};
+        for (const name of ['etag', 'last-modified']) {
+          const value = response.headers.get(name);
+          if (value) extra[name] = value;
+        }
+        const asset: CachedAsset = { status: 200, contentType, finalUrl, body, headers: extra, storedAt: Date.now() };
+        assetCache.set(cacheKey, asset);
+        return await emitAsset(asset, 'miss');
+      }
 
       if (isDocument && (response.status === 401 || response.status === 403)) {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -800,6 +860,27 @@ export function createApiApp(): express.Express {
           }
         });
 
+        // Redirect stubs (meta refresh, or a script that just calls location.replace) must navigate through the app,
+        // not the real URL, so hand them to the bridge instead of letting them run or silently deleting them.
+        const redirects: { url: string; delayMs: number }[] = [];
+        $('meta[http-equiv]').each((_, el) => {
+          if (($(el).attr('http-equiv') || '').toLowerCase() !== 'refresh') return;
+          const match = ($(el).attr('content') || '').match(/^\s*(\d+(?:\.\d+)?)?\s*[;,]?\s*(?:url\s*=\s*)?['"]?([^'"]+)/i);
+          if (!match || !match[2]) return;
+          try {
+            redirects.push({ url: new URL(match[2].trim(), finalUrl).toString(), delayMs: Math.min(60, Number(match[1] || 0)) * 1000 });
+          } catch {}
+        });
+        $('script:not([src])').each((_, el) => {
+          const code = $(el).html() || '';
+          if (code.length > 800) return;
+          const match = code.match(/(?:window\.)?(?:parent\.|top\.)?location(?:\.href\s*=|\.replace\(|\.assign\(|\s*=)\s*(['"])([^'"]+)\1/);
+          if (!match) return;
+          try {
+            redirects.push({ url: new URL(match[2], finalUrl).toString(), delayMs: 0 });
+            $(el).remove();
+          } catch {}
+        });
         $('meta[http-equiv="refresh"]').remove();
 
         // Honour a <base href> the page already declares, then pin it to an absolute URL.
@@ -813,7 +894,7 @@ export function createApiApp(): express.Express {
         $('base').remove();
 
         rewriteHtmlResources($, docBase, rewriteCtx);
-        $('head').prepend(`<base href="${docBase}">${buildClientShim(rewriteCtx)}`);
+        $('head').prepend(`<base href="${docBase}">${buildClientShim(rewriteCtx, docBase)}`);
 
         const bridgeScript = `
         <script id="__apex_browser_bridge__">
@@ -863,6 +944,14 @@ export function createApiApp(): express.Express {
 
               try {
                 var resolved = new URL(href, currentUrl).href;
+                try {
+                  // Search results link through a tracking redirect; go straight to the destination.
+                  var ru = new URL(resolved);
+                  var isDdg = ru.hostname === 'duckduckgo.com' || ru.hostname.slice(-14) === '.duckduckgo.com';
+                  var isGoogle = ru.hostname.indexOf('google.') !== -1;
+                  if (isDdg && ru.pathname === '/l/' && ru.searchParams.get('uddg')) resolved = ru.searchParams.get('uddg');
+                  else if (isGoogle && ru.pathname === '/url' && (ru.searchParams.get('q') || ru.searchParams.get('url'))) resolved = ru.searchParams.get('q') || ru.searchParams.get('url');
+                } catch(e) {}
                 if (resolved.startsWith('http://') || resolved.startsWith('https://')) {
                   e.preventDefault();
                   e.stopPropagation();
@@ -906,10 +995,13 @@ export function createApiApp(): express.Express {
         </script>
       `;
 
-        $('head').append(bridgeScript);
+        const redirect = redirects.sort((a, b) => a.delayMs - b.delayMs)[0];
+        const redirectScript = redirect && redirect.url !== finalUrl
+          ? `<script>setTimeout(function () { window.parent.postMessage({ type: 'APEX_NAVIGATE_TO', url: ${JSON.stringify(redirect.url).replace(/</g, '\\u003c')} }, '*'); }, ${redirect.delayMs});</script>`
+          : '';
+        $('head').append(bridgeScript + redirectScript);
 
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.send($.html());
+        return await sendText(req, res, 200, 'text/html; charset=utf-8', $.html());
       }
 
       // Subresources, API calls and non-HTML documents.
