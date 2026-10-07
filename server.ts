@@ -13,6 +13,21 @@ const PORT = process.env.NODE_ENV === 'production' && process.env.PORT ? Number(
 async function setupServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
+  // Proxied pages see their real path (history.replaceState), so a page that calls location.reload() or sets a
+  // relative location.href would load this app inside the viewport. Hand those back to the browser chrome instead.
+  app.use((req: Request, res: Response, next) => {
+    if (req.headers['sec-fetch-dest'] === 'iframe' && !req.path.startsWith('/api/')) {
+      res.setHeader('Cache-Control', 'no-store');
+      return res
+        .status(200)
+        .type('html')
+        .send(
+          "<!doctype html><script>try{window.parent.postMessage({type:'APEX_NAVIGATE_REL',path:location.pathname+location.search+location.hash},'*')}catch(e){}</script>",
+        );
+    }
+    next();
+  });
+
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

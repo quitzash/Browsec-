@@ -129,6 +129,19 @@ export const WebFrame: React.FC<WebFrameProps> = ({
           }
           break;
 
+        case 'APEX_NAVIGATE_REL':
+          // The page reloaded itself or navigated to a relative path; resolve it against the page's real URL.
+          if (typeof event.data.path === 'string') {
+            try {
+              const next = new URL(event.data.path, url).toString();
+              if (next === url) onSetLoading(true);
+              else onNavigate(next);
+            } catch {
+              // unresolvable path: ignore
+            }
+          }
+          break;
+
         case 'APEX_NAVIGATE_HOME':
           onNavigate('apex://newtab');
           break;
@@ -143,7 +156,7 @@ export const WebFrame: React.FC<WebFrameProps> = ({
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [onNavigate, onUpdateMetadata, onSetLoading, onSwitchToDirect]);
+  }, [onNavigate, onUpdateMetadata, onSetLoading, onSwitchToDirect, url]);
 
   // Handle iframe load event
   const handleIframeLoad = () => {

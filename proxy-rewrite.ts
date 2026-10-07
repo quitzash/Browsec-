@@ -144,6 +144,14 @@ export function rewriteHtmlResources($: CheerioAPI, base: string, ctx: RewriteCt
 const SHIM_SOURCE = String.raw`
 (function () {
   var CTX = __CTX__;
+  // Single-page apps (Next.js, Remix, React Router...) compare location.pathname with the route they were rendered for.
+  // Show them their real path instead of /api/proxy/..., or they decide the page is wrong and reload forever.
+  try {
+    var pageUrl = new URL(CTX.page);
+    // An explicit origin is required: a bare path would resolve against <base> (the real site) and be rejected as cross-origin.
+    history.replaceState(history.state, '', location.origin + '/' + pageUrl.pathname.replace(/^\/+/, '') + pageUrl.search + pageUrl.hash);
+  } catch (e) {}
+
   var seg = encodeURIComponent(CTX.tabId || '-') + '.' + (CTX.isPrivate === 'true' ? 1 : 0);
   var SKIP = /^(data|blob|javascript|about|mailto|tel|sms):/i;
 
@@ -156,7 +164,8 @@ const SHIM_SOURCE = String.raw`
       if (abs.protocol !== 'http:' && abs.protocol !== 'https:') return u;
       if (abs.origin === location.origin && abs.pathname.indexOf('/api/proxy') === 0) return u;
       // Pages build URLs from location.origin, which here is this app. They mean their own site.
-      if (abs.origin === location.origin) { try { abs = new URL(abs.pathname + abs.search, CTX.base); } catch (e) {} }
+      // They may also drop the port (location.hostname + path), which lands on plain "localhost".
+      if (abs.origin === location.origin || abs.hostname === location.hostname) { try { abs = new URL(abs.pathname + abs.search, CTX.base); } catch (e) {} }
       return location.origin + '/api/proxy/' + seg + '/' + abs.protocol.slice(0, -1) + '/' + abs.host + abs.pathname + abs.search;
     } catch (e) { return u; }
   }
@@ -235,7 +244,7 @@ const SHIM_SOURCE = String.raw`
 })();
 `;
 
-export function buildClientShim(ctx: Pick<RewriteCtx, 'tabId' | 'isPrivate'>, realBase: string): string {
-  const payload = JSON.stringify({ tabId: ctx.tabId, isPrivate: ctx.isPrivate ? 'true' : 'false', base: realBase }).replace(/</g, '\\u003c');
+export function buildClientShim(ctx: Pick<RewriteCtx, 'tabId' | 'isPrivate'>, realBase: string, pageUrl: string): string {
+  const payload = JSON.stringify({ tabId: ctx.tabId, isPrivate: ctx.isPrivate ? 'true' : 'false', base: realBase, page: pageUrl }).replace(/</g, '\\u003c');
   return `<script id="__apex_proxy_shim__">${SHIM_SOURCE.replace('__CTX__', payload)}</script>`;
 }

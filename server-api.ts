@@ -894,7 +894,7 @@ export function createApiApp(): express.Express {
         $('base').remove();
 
         rewriteHtmlResources($, docBase, rewriteCtx);
-        $('head').prepend(`<base href="${docBase}">${buildClientShim(rewriteCtx, docBase)}`);
+        $('head').prepend(`<base href="${docBase}">${buildClientShim(rewriteCtx, docBase, finalUrl)}`);
 
         const bridgeScript = `
         <script id="__apex_browser_bridge__">
