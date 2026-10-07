@@ -1,7 +1,16 @@
-import React from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { BrowserSettings } from '../../types';
 import { SEARCH_ENGINES, THEMES } from '../../constants/presets';
-import { Settings, X, Shield, Search, Globe, Bookmark, Palette } from 'lucide-react';
+import { Settings, X, Shield, Search, Globe, Bookmark, Palette, Network, Activity } from 'lucide-react';
+
+interface UpstreamProxyStatus {
+  enabled: boolean;
+  url: string;
+  source: 'env' | 'runtime' | 'none';
+  error: string | null;
+  active: boolean;
+  lastTest: { ok: boolean; latencyMs: number | null; error: string | null; checkedAt: number } | null;
+}
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -16,7 +25,58 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   settings,
   onUpdateSettings,
 }) => {
+  const [proxy, setProxy] = useState<UpstreamProxyStatus | null>(null);
+  const [proxyUrl, setProxyUrl] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    fetch('/api/network')
+      .then((res) => res.json())
+      .then((data) => {
+        if (!cancelled && data.proxy) {
+          setProxy(data.proxy);
+          setProxyUrl(data.proxy.url);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen]);
+
+  const saveProxy = useCallback(async (payload: { enabled?: boolean; url?: string; test?: boolean }) => {
+    setBusy(true);
+    try {
+      const params = new URLSearchParams();
+      if (typeof payload.enabled === 'boolean') params.set('enabled', String(payload.enabled));
+      if (typeof payload.url === 'string') params.set('url', payload.url);
+      if (payload.test) params.set('test', 'true');
+      const res = await fetch(`/api/network?${params.toString()}`, { method: 'POST' });
+      const data = await res.json();
+      if (data.proxy) {
+        setProxy(data.proxy);
+        setProxyUrl(data.proxy.url);
+      }
+    } catch {
+      // network failure keeps the previous status on screen
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
   if (!isOpen) return null;
+
+  const statusBadge = !proxy ? (
+    <span className="text-[10px] font-medium text-neutral-500">loading…</span>
+  ) : proxy.error ? (
+    <span className="text-[10px] font-medium text-red-400">error</span>
+  ) : proxy.active ? (
+    <span className="text-[10px] font-medium text-emerald-400">active</span>
+  ) : (
+    <span className="text-[10px] font-medium text-neutral-500">off</span>
+  );
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in duration-150">
@@ -119,6 +179,74 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <span className="font-medium text-xs">{th.name}</span>
                 </button>
               ))}
+            </div>
+          </div>
+
+          <div className="h-px bg-[#242630]" />
+
+          {/* Upstream Proxy Mode */}
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-white flex items-center gap-1.5">
+              <Network className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Upstream Proxy Mode</span>
+              {statusBadge}
+            </label>
+            <p className="text-[11px] text-neutral-400">
+              Sends every server-side request through a proxy you control, so the local network only sees traffic to that proxy host. Leave empty to connect directly.
+            </p>
+            <div className="flex gap-2 pt-1">
+              <input
+                type="text"
+                value={proxyUrl}
+                onChange={(e) => setProxyUrl(e.target.value)}
+                placeholder="http://user:pass@proxy.host:8080"
+                spellCheck={false}
+                className="flex-1 min-w-0 bg-[#191b22] border border-[#272933] rounded-lg px-2.5 py-2 text-xs text-white placeholder:text-neutral-500 focus:outline-none focus:border-sky-500 font-mono"
+              />
+              <button
+                onClick={() => saveProxy({ url: proxyUrl })}
+                disabled={busy}
+                className="px-3 py-2 rounded-lg border border-[#272933] bg-[#191b22] text-neutral-200 hover:bg-[#20222b] text-xs font-medium disabled:opacity-50 transition-colors"
+              >
+                Save
+              </button>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-neutral-400">
+                {proxy?.active ? 'Proxy mode is routing outbound traffic' : 'Proxy mode is off'}
+              </span>
+              <button
+                onClick={() => saveProxy({ enabled: !proxy?.enabled })}
+                disabled={busy || (!!proxy && !proxy.enabled && !proxyUrl.trim())}
+                className={`w-10 h-5 rounded-full p-0.5 transition-colors disabled:opacity-40 ${
+                  proxy?.enabled ? 'bg-emerald-600' : 'bg-neutral-800'
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                    proxy?.enabled ? 'translate-x-5' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-neutral-400 truncate">
+                {proxy?.error
+                  ? proxy.error
+                  : proxy?.lastTest
+                    ? proxy.lastTest.ok
+                      ? `Last check: ${proxy.lastTest.latencyMs}ms`
+                      : `Last check failed: ${proxy.lastTest.error}`
+                    : 'No connection check yet'}
+              </span>
+              <button
+                onClick={() => saveProxy({ test: true })}
+                disabled={busy}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-[#272933] bg-[#191b22] text-neutral-200 hover:bg-[#20222b] text-[11px] font-medium disabled:opacity-50 transition-colors shrink-0"
+              >
+                <Activity className="w-3 h-3" />
+                Test
+              </button>
             </div>
           </div>
 
