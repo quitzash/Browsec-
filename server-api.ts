@@ -2,7 +2,8 @@ import express from 'express';
 import type { Request, Response } from 'express';
 import * as cheerio from 'cheerio';
 import dotenv from 'dotenv';
-import { Agent, ProxyAgent, fetch as undiciFetch, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
+import { Agent, fetch as undiciFetch, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
+import { makeProxyAgent } from './proxy-agent.ts';
 import net from 'net';
 import { Readable } from 'stream';
 import { createHash, createHmac, randomBytes } from 'crypto';
@@ -78,7 +79,7 @@ function applyUpstreamProxy(): void {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new Error('The VPN server address must start with http:// or https://');
     }
-    setGlobalDispatcher(new ProxyAgent(upstream.url));
+    setGlobalDispatcher(makeProxyAgent(upstream.url));
     upstream.error = null;
   } catch (err: any) {
     upstream.error = err?.message || 'Invalid VPN server address';
