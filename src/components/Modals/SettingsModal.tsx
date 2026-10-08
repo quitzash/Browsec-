@@ -641,7 +641,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
               {scanning && (
                 <p className="text-[11px] text-neutral-500">
-                  Testing hundreds of free VPN servers for speed and stability. Only servers that can actually load search results are listed. This takes about 30 seconds.
+                  Testing free VPN servers for speed and stability. Badges show which search engines each server can load; servers without badges can still open most websites. This takes about 30 seconds.
                 </p>
               )}
               {scanError && <p className="text-[11px] text-red-400">{scanError}</p>}
@@ -649,7 +649,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               {scan && !scanning && (
                 <>
                   {rankedItems.length === 0 ? (
-                    <p className="text-[11px] text-neutral-500">No VPN servers that can load search engines right now. Try rescanning.</p>
+                    <p className="text-[11px] text-neutral-500">No working free VPN servers for {countryName(matchCountry)} right now. Public lists for this country are mostly dead or censored right now — try another country or rescan.</p>
                   ) : (
                     <ul className="space-y-1">
                       {rankedItems.map((item, index) => {
