@@ -5,7 +5,8 @@ import net from 'net';
 import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
-import { Agent, ProxyAgent, fetch as undiciFetch } from 'undici';
+import { Agent, fetch as undiciFetch } from 'undici';
+import { makeProxyAgent } from './proxy-agent.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -218,7 +219,7 @@ async function killStale(): Promise<void> {
 }
 
 async function readTrace(url: string, timeoutMs: number): Promise<Record<string, string> | null> {
-  const agent = new ProxyAgent({ uri: url, connectTimeout: timeoutMs });
+  const agent = makeProxyAgent(url, { connectTimeout: timeoutMs });
   try {
     const res = await undiciFetch('https://www.cloudflare.com/cdn-cgi/trace', { dispatcher: agent, signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) return null;
