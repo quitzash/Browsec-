@@ -575,21 +575,38 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </p>
                       <div className="flex gap-2 pt-1">
                         <button
-                          onClick={() => {
-                            window.open('https://xvpn.io', '_blank', 'noopener,noreferrer');
+                          onClick={async () => {
+                            setLocBusy(true);
+                            setLocMsg('Connecting via X-VPN protocol obfuscation tunnel…');
+                            try {
+                              const res = await fetch('/api/network?provider=xvpn&enabled=true', { method: 'POST' });
+                              const data = await res.json();
+                              if (data.proxy) {
+                                setProxy(data.proxy);
+                                setProxyUrl(data.proxy.url);
+                              }
+                              setLocMsg('Connected to X-VPN multi-protocol tunnel.');
+                              await refreshEgress();
+                            } catch {
+                              setLocMsg('X-VPN connection failed.');
+                            } finally {
+                              setLocBusy(false);
+                            }
                           }}
-                          className="flex-1 py-1.5 px-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-medium transition-colors"
+                          disabled={locBusy || busy}
+                          className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-medium disabled:opacity-50 transition-colors"
                         >
-                          Open X-VPN Portal
+                          <Shield className={`w-3.5 h-3.5 ${locBusy ? 'animate-pulse' : ''}`} />
+                          {locBusy ? 'Connecting…' : proxy?.active && proxy.provider === 'xvpn' ? 'Connected (X-VPN)' : 'Connect X-VPN'}
                         </button>
-                        {proxy?.active && proxy.provider === 'xvpn' ? (
+                        {proxy?.active && (
                           <button
                             onClick={disconnectVpn}
                             className="py-1.5 px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-medium transition-colors"
                           >
                             Disconnect
                           </button>
-                        ) : null}
+                        )}
                       </div>
                     </div>
                   </>
@@ -610,21 +627,38 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </p>
                       <div className="flex gap-2 pt-1">
                         <button
-                          onClick={() => {
-                            window.open('https://potatovpn.io', '_blank', 'noopener,noreferrer');
+                          onClick={async () => {
+                            setLocBusy(true);
+                            setLocMsg('Connecting via Potato VPN zero-log stream tunnel…');
+                            try {
+                              const res = await fetch('/api/network?provider=potatovpn&enabled=true', { method: 'POST' });
+                              const data = await res.json();
+                              if (data.proxy) {
+                                setProxy(data.proxy);
+                                setProxyUrl(data.proxy.url);
+                              }
+                              setLocMsg('Connected to Potato VPN private tunnel.');
+                              await refreshEgress();
+                            } catch {
+                              setLocMsg('Potato VPN connection failed.');
+                            } finally {
+                              setLocBusy(false);
+                            }
                           }}
-                          className="flex-1 py-1.5 px-3 bg-yellow-600 hover:bg-yellow-500 text-white rounded-lg text-xs font-medium transition-colors"
+                          disabled={locBusy || busy}
+                          className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-3 bg-yellow-600 hover:bg-yellow-500 text-white rounded-lg text-xs font-medium disabled:opacity-50 transition-colors"
                         >
-                          Open Potato VPN Portal
+                          <Shield className={`w-3.5 h-3.5 ${locBusy ? 'animate-pulse' : ''}`} />
+                          {locBusy ? 'Connecting…' : proxy?.active && proxy.provider === 'potatovpn' ? 'Connected (Potato VPN)' : 'Connect Potato VPN'}
                         </button>
-                        {proxy?.active && proxy.provider === 'potatovpn' ? (
+                        {proxy?.active && (
                           <button
                             onClick={disconnectVpn}
                             className="py-1.5 px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-medium transition-colors"
                           >
                             Disconnect
                           </button>
-                        ) : null}
+                        )}
                       </div>
                     </div>
                   </>
