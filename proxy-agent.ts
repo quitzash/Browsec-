@@ -18,6 +18,7 @@ interface ConnectTunnel {
 export function makeProxyAgent(uri: string, opts: object = {}): ProxyAgent {
   const options = {
     uri,
+    connect: { timeout: 10000, ...(opts as any)?.connect },
     ...opts,
     clientFactory: (origin: URL, factoryOpts: object): Dispatcher => {
       const dispatcher = new Pool(String(origin), factoryOpts) as unknown as ConnectTunnel;
