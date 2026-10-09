@@ -36,6 +36,9 @@ const SOURCES = [
   'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt',
   'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
   'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
+  'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt',
+  'https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt',
+  'https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_Architecture.txt',
 ];
 
 interface Target {
@@ -92,6 +95,8 @@ const PROXYSCRAPE_COUNTRY = (code: string) =>
   `https://api.proxyscrape.com/v2/?request=getproxies&country=${code}&protocol=http&timeout=3000`;
 const GEONODE_COUNTRY = (code: string) =>
   `https://proxylist.geonode.com/api/proxy-list?country=${code}&protocols=http%2Chttps&limit=300&page=1&sort=lastChecked&order=desc`;
+const PROXYSCRAPE_GENERAL =
+  'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=4000&country=all&ssl=all&anonymity=all';
 
 function parseIpPortList(text: string): string[] {
   const out: string[] = [];
@@ -135,6 +140,7 @@ async function loadCandidates(country?: string): Promise<string[]> {
     entries.push([GEONODE_COUNTRY(code), parseGeonode]);
   } else {
     for (const source of SOURCES) entries.push([source, parseIpPortList]);
+    entries.push([PROXYSCRAPE_GENERAL, parseIpPortList]);
   }
 
   const lists = await Promise.allSettled(entries.map(([url]) => httpList(url)));
