@@ -29,7 +29,7 @@ type FetchResponse = Awaited<ReturnType<typeof fetch>>;
 
 type ProxyTestResult = { ok: boolean; latencyMs: number | null; error: string | null; checkedAt: number };
 
-type VpnProvider = 'warp' | 'free' | 'custom' | 'none';
+type VpnProvider = 'warp' | 'xvpn' | 'potatovpn' | 'free' | 'custom' | 'none';
 
 interface UpstreamProxyState {
   enabled: boolean;
@@ -408,7 +408,9 @@ export function createApiApp(): express.Express {
       } else {
         upstream.url = next;
         upstream.source = 'runtime';
-        upstream.provider = rawProvider === 'free' ? 'free' : 'custom';
+        upstream.provider = (['warp', 'xvpn', 'potatovpn', 'free', 'custom'].includes(String(rawProvider))
+          ? rawProvider
+          : 'custom') as VpnProvider;
       }
     }
 

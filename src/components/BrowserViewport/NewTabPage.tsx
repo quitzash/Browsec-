@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Search, Globe, Sparkles, BookOpen, Clock, ArrowUpRight, Compass, KeyRound, ShieldCheck } from 'lucide-react';
-import { SPEED_DIAL_SITES, SEARCH_ENGINES } from '../../constants/presets';
+import { SPEED_DIAL_SITES, SEARCH_ENGINES, VPN_APPS } from '../../constants/presets';
 import { HistoryItem } from '../../types';
 
 interface NewTabPageProps {
@@ -137,6 +137,70 @@ export const NewTabPage: React.FC<NewTabPageProps> = ({
             </div>
           </div>
         </form>
+
+        {/* Featured Integrated VPN Apps */}
+        <div className="w-full mb-10">
+          <div className="flex items-center justify-between mb-3 px-1">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-neutral-400 flex items-center gap-1.5">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Integrated VPN Apps & Services</span>
+            </h2>
+            <span className="text-xs text-emerald-400/90 font-mono flex items-center gap-1">
+              <Sparkles className="w-3 h-3" /> Dedicated Portals &amp; Tunnels
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            {VPN_APPS.map((app) => (
+              <div
+                key={app.id}
+                className="group relative flex flex-col justify-between p-4 bg-[#161820] hover:bg-[#1c1e28] border border-[#262936] hover:border-[#383d50] rounded-xl transition-all duration-150 hover:-translate-y-0.5 shadow-md"
+              >
+                <div>
+                  <div className="flex items-center justify-between mb-2.5">
+                    <div
+                      className="w-9 h-9 rounded-xl flex items-center justify-center text-lg shadow-sm"
+                      style={{ backgroundColor: `${app.accent}20`, border: `1px solid ${app.accent}40` }}
+                    >
+                      <span>{app.icon}</span>
+                    </div>
+                    {app.badge && (
+                      <span
+                        className="px-2 py-0.5 rounded-full text-[10px] font-semibold tracking-wide uppercase"
+                        style={{ backgroundColor: `${app.accent}20`, color: app.accent, border: `1px solid ${app.accent}30` }}
+                      >
+                        {app.badge}
+                      </span>
+                    )}
+                  </div>
+                  <h3 className="text-xs font-bold text-white group-hover:text-sky-300 transition-colors">
+                    {app.name}
+                  </h3>
+                  <p className="text-[11px] text-neutral-400 line-clamp-2 mt-1 leading-relaxed">
+                    {app.desc}
+                  </p>
+                </div>
+
+                <div className="mt-3 pt-3 border-t border-[#232633] flex items-center justify-between">
+                  <div className="flex flex-wrap gap-1">
+                    {app.features.slice(0, 2).map((feat, i) => (
+                      <span key={i} className="text-[9px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-300">
+                        {feat}
+                      </span>
+                    ))}
+                  </div>
+                  <button
+                    onClick={() => onNavigate(app.url)}
+                    className="p-1 rounded-md text-neutral-400 hover:text-white hover:bg-[#2b2e3c] transition-colors"
+                    title={`Open ${app.name} portal`}
+                  >
+                    <ArrowUpRight className="w-4 h-4 text-sky-400" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
 
         {/* Speed Dial Grid */}
         <div className="w-full mb-12">
