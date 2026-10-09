@@ -1,4 +1,50 @@
-import { SearchEngine, Bookmark } from '../types';
+import { SearchEngine, Bookmark, VpnApp } from '../types';
+
+export const VPN_APPS: VpnApp[] = [
+  {
+    id: 'xvpn',
+    name: 'X-VPN',
+    provider: 'xvpn',
+    url: 'https://xvpn.io',
+    desc: 'High-speed encrypted VPN with 8000+ servers worldwide and protocol obfuscation.',
+    icon: '🛡️',
+    accent: '#2563eb',
+    badge: 'Popular',
+    features: ['8,000+ Servers', 'Advanced Security', 'Multi-Protocol Support', 'Unlimited Bandwidth'],
+  },
+  {
+    id: 'potatovpn',
+    name: 'Potato VPN',
+    provider: 'potatovpn',
+    url: 'https://potatovpn.io',
+    desc: 'Fast, stable & private VPN proxy with one-tap connection and zero logs policy.',
+    icon: '🥔',
+    accent: '#eab308',
+    badge: 'Fast & Simple',
+    features: ['One-Tap Connect', 'No Logs Policy', 'Global Locations', 'Streaming Optimized'],
+  },
+  {
+    id: 'warp',
+    name: 'Cloudflare WARP',
+    provider: 'warp',
+    url: 'https://1.1.1.1',
+    desc: 'Fast, free, and secure DNS & WireGuard-based VPN connection by Cloudflare.',
+    icon: '⚡',
+    accent: '#f97316',
+    badge: 'Built-in Tunnel',
+    features: ['WireGuard Protocol', 'Privacy First', 'Low Latency', 'Built-in Integration'],
+  },
+  {
+    id: 'protonvpn',
+    name: 'Proton VPN',
+    provider: 'custom',
+    url: 'https://protonvpn.com',
+    desc: 'Swiss-based high-speed VPN protecting privacy with strong encryption.',
+    icon: '🔒',
+    accent: '#8b5cf6',
+    features: ['Swiss Privacy Laws', 'AES-256 Encryption', 'Secure Core', 'Open Source'],
+  },
+];
 
 export const SEARCH_ENGINES: SearchEngine[] = [
   {
@@ -34,6 +80,20 @@ export const SEARCH_ENGINES: SearchEngine[] = [
 ];
 
 export const DEFAULT_BOOKMARKS: Bookmark[] = [
+  {
+    id: 'bm-xvpn',
+    title: 'X-VPN Portal',
+    url: 'https://xvpn.io',
+    category: 'VPN',
+    createdAt: Date.now() - 110000,
+  },
+  {
+    id: 'bm-potatovpn',
+    title: 'Potato VPN',
+    url: 'https://potatovpn.io',
+    category: 'VPN',
+    createdAt: Date.now() - 105000,
+  },
   {
     id: 'bm-wiki',
     title: 'Wikipedia',
@@ -93,6 +153,20 @@ export const DEFAULT_BOOKMARKS: Bookmark[] = [
 ];
 
 export const SPEED_DIAL_SITES = [
+  {
+    title: 'X-VPN',
+    url: 'https://xvpn.io',
+    desc: 'Fast & Secure Global VPN Service',
+    icon: '🛡️',
+    accent: '#1d4ed8',
+  },
+  {
+    title: 'Potato VPN',
+    url: 'https://potatovpn.io',
+    desc: 'Private & Stable VPN Proxy App',
+    icon: '🥔',
+    accent: '#ca8a04',
+  },
   {
     title: 'Wikipedia',
     url: 'https://en.wikipedia.org/wiki/Main_Page',
