@@ -87,3 +87,17 @@ export interface BrowserSettings {
   /** 'direct' loads sites from the visitor's own browser and connection; 'proxy' goes through this server. */
   defaultMode: 'proxy' | 'direct';
 }
+
+export type VpnProviderType = 'warp' | 'xvpn' | 'potatovpn' | 'free' | 'custom' | 'none';
+
+export interface VpnApp {
+  id: string;
+  name: string;
+  provider: VpnProviderType;
+  url: string;
+  desc: string;
+  icon: string;
+  accent: string;
+  badge?: string;
+  features: string[];
+}

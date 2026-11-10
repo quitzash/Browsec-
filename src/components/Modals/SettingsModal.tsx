@@ -8,7 +8,7 @@ interface UpstreamProxyStatus {
   url: string;
   source: 'env' | 'runtime' | 'none';
   /** Which VPN service is behind the connection. */
-  provider?: 'warp' | 'free' | 'custom' | 'none';
+  provider?: 'warp' | 'xvpn' | 'potatovpn' | 'free' | 'custom' | 'none';
   error: string | null;
   active: boolean;
   lastTest: { ok: boolean; latencyMs: number | null; error: string | null; checkedAt: number } | null;
@@ -94,7 +94,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [realFailed, setRealFailed] = useState(false);
   const [matchCountry, setMatchCountry] = useState('');
   // Which VPN service the Connect button uses, and whether the Cloudflare WARP helper can run on this machine.
-  const [service, setService] = useState<'warp' | 'free'>('warp');
+  const [service, setService] = useState<'warp' | 'xvpn' | 'potatovpn' | 'free'>('warp');
   const [warp, setWarp] = useState<{ supported: boolean; reason?: string; installed: boolean; registered: boolean; running: boolean } | null>(null);
   const [locBusy, setLocBusy] = useState(false);
   const [locMsg, setLocMsg] = useState<string | null>(null);
@@ -515,14 +515,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <span className="text-[11px] text-neutral-400 shrink-0">VPN service</span>
                   <select
                     value={service}
-                    onChange={(e) => setService(e.target.value as 'warp' | 'free')}
+                    onChange={(e) => setService(e.target.value as any)}
                     disabled={locBusy}
                     className="flex-1 min-w-0 bg-[#191b22] border border-[#272933] rounded-lg px-2.5 py-2 text-xs text-white focus:outline-none focus:border-sky-500"
                   >
                     <option value="warp" disabled={warp?.supported === false}>
-                      Cloudflare WARP: fast and reliable
+                      ⚡ Cloudflare WARP: fast and reliable WireGuard
                     </option>
-                    <option value="free">Free servers: pick a country, slower</option>
+                    <option value="xvpn">
+                      🛡️ X-VPN: high-speed multi-protocol encrypted tunnel
+                    </option>
+                    <option value="potatovpn">
+                      🥔 Potato VPN: fast &amp; stable private proxy
+                    </option>
+                    <option value="free">🌐 Free servers: pick a country, slower</option>
                   </select>
                 </div>
 
@@ -551,6 +557,110 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <p className="text-[10px] text-neutral-500 leading-relaxed">
                       WARP is Cloudflare's free VPN service. It hides this server's address and is much faster than free servers, but Cloudflare picks the exit near the server, so you cannot choose another country with it. The first connection downloads two small helper programs (checked against published checksums) and registers a free WARP device, which accepts Cloudflare's terms.
                     </p>
+                  </>
+                ) : service === 'xvpn' ? (
+                  <>
+                    <div className="p-3 bg-[#181d2c] border border-blue-500/30 rounded-xl space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="text-base">🛡️</span>
+                          <span className="font-semibold text-blue-200 text-xs">X-VPN Proxy Gateway</span>
+                        </div>
+                        <span className="text-[10px] font-semibold text-blue-300 bg-blue-500/20 px-2 py-0.5 rounded-full border border-blue-500/30">
+                          8000+ Nodes
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-300 leading-relaxed">
+                        X-VPN uses custom obfuscated protocols to bypass deep packet inspection and network throttle restrictions. Configure an X-VPN proxy endpoint or connect via one-click integration.
+                      </p>
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          onClick={async () => {
+                            setLocBusy(true);
+                            setLocMsg('Connecting via X-VPN protocol obfuscation tunnel…');
+                            try {
+                              const res = await fetch('/api/network?provider=xvpn&enabled=true', { method: 'POST' });
+                              const data = await res.json();
+                              if (data.proxy) {
+                                setProxy(data.proxy);
+                                setProxyUrl(data.proxy.url);
+                              }
+                              setLocMsg('Connected to X-VPN multi-protocol tunnel.');
+                              await refreshEgress();
+                            } catch {
+                              setLocMsg('X-VPN connection failed.');
+                            } finally {
+                              setLocBusy(false);
+                            }
+                          }}
+                          disabled={locBusy || busy}
+                          className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-medium disabled:opacity-50 transition-colors"
+                        >
+                          <Shield className={`w-3.5 h-3.5 ${locBusy ? 'animate-pulse' : ''}`} />
+                          {locBusy ? 'Connecting…' : proxy?.active && proxy.provider === 'xvpn' ? 'Connected (X-VPN)' : 'Connect X-VPN'}
+                        </button>
+                        {proxy?.active && (
+                          <button
+                            onClick={disconnectVpn}
+                            className="py-1.5 px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-medium transition-colors"
+                          >
+                            Disconnect
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                ) : service === 'potatovpn' ? (
+                  <>
+                    <div className="p-3 bg-[#242116] border border-yellow-500/30 rounded-xl space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="text-base">🥔</span>
+                          <span className="font-semibold text-yellow-200 text-xs">Potato VPN Service</span>
+                        </div>
+                        <span className="text-[10px] font-semibold text-yellow-300 bg-yellow-500/20 px-2 py-0.5 rounded-full border border-yellow-500/30">
+                          Zero Logs
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-300 leading-relaxed">
+                        Potato VPN provides fast, lightweight and secure connection nodes with strict zero-logging policies and streaming optimization.
+                      </p>
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          onClick={async () => {
+                            setLocBusy(true);
+                            setLocMsg('Connecting via Potato VPN zero-log stream tunnel…');
+                            try {
+                              const res = await fetch('/api/network?provider=potatovpn&enabled=true', { method: 'POST' });
+                              const data = await res.json();
+                              if (data.proxy) {
+                                setProxy(data.proxy);
+                                setProxyUrl(data.proxy.url);
+                              }
+                              setLocMsg('Connected to Potato VPN private tunnel.');
+                              await refreshEgress();
+                            } catch {
+                              setLocMsg('Potato VPN connection failed.');
+                            } finally {
+                              setLocBusy(false);
+                            }
+                          }}
+                          disabled={locBusy || busy}
+                          className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-3 bg-yellow-600 hover:bg-yellow-500 text-white rounded-lg text-xs font-medium disabled:opacity-50 transition-colors"
+                        >
+                          <Shield className={`w-3.5 h-3.5 ${locBusy ? 'animate-pulse' : ''}`} />
+                          {locBusy ? 'Connecting…' : proxy?.active && proxy.provider === 'potatovpn' ? 'Connected (Potato VPN)' : 'Connect Potato VPN'}
+                        </button>
+                        {proxy?.active && (
+                          <button
+                            onClick={disconnectVpn}
+                            className="py-1.5 px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-medium transition-colors"
+                          >
+                            Disconnect
+                          </button>
+                        )}
+                      </div>
+                    </div>
                   </>
                 ) : (
                   <>
